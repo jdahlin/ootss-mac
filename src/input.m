@@ -136,6 +136,10 @@ static bool g_raw_mouse, g_raw_keyboard, g_raw_mouse_only, g_raw_keyboard_only; 
 static RAWINPUT g_raw[RAW_SLOTS];
 static uint32_t g_raw_next;
 
+// Mouse motion arrives far faster than a game drains its queue. Consecutive motion is merged into the newest
+// unread record, so it can neither fill the ring (overwriting queued key events) nor lag behind the hand.
+static int g_pending_motion = -1; // slot of the newest queued, unread motion record, or -1
+
 static void post_raw_input(const RAWINPUT *input) {
     uint32_t slot = g_raw_next++ % RAW_SLOTS;
     g_raw[slot] = *input;
@@ -149,7 +153,14 @@ static void post_raw_mouse(int dx, int dy, WORD button_flags, short wheel) {
     input.data.mouse.usButtonData = (WORD)wheel;
     input.data.mouse.lLastX = dx; // relative motion
     input.data.mouse.lLastY = dy;
+    bool motion_only = !button_flags && !wheel;
+    if (motion_only && g_pending_motion >= 0) {
+        g_raw[g_pending_motion].data.mouse.lLastX += dx;
+        g_raw[g_pending_motion].data.mouse.lLastY += dy;
+        return;
+    }
     post_raw_input(&input);
+    g_pending_motion = motion_only ? (int)((g_raw_next - 1) % RAW_SLOTS) : -1;
 }
 
 SHIM(WBOOL, RegisterRawInputDevices, const RAWINPUTDEVICE *devices, UINT count, UINT size) {
@@ -171,6 +182,7 @@ SHIM(WBOOL, RegisterRawInputDevices, const RAWINPUTDEVICE *devices, UINT count, 
 SHIM(UINT, GetRawInputData, HANDLE handle, UINT command, void *data, UINT *size, UINT header_size) {
     uintptr_t slot = (uintptr_t)handle - FIRST_RAW_HANDLE;
     if (slot >= RAW_SLOTS) return (UINT)-1;
+    if ((int)slot == g_pending_motion) g_pending_motion = -1; // read: later motion needs a new record
     const RAWINPUT *input = &g_raw[slot];
     UINT needed = command == RID_HEADER ? sizeof input->header : input->header.dwSize;
     if (!data) {
@@ -204,6 +216,7 @@ static void key_event(unsigned short mac_code, bool down, bool repeat) {
         post_message(g_window, message, legacy_vk, lparam);
     }
     if (g_raw_keyboard && !repeat) {
+        g_pending_motion = -1; // keep events in order
         RAWINPUT input = {.header = {RIM_TYPEKEYBOARD, sizeof input.header + sizeof input.data.keyboard,
                                      RAW_KEYBOARD_DEVICE, RIM_INPUT}};
         input.data.keyboard.MakeCode = scan & 0xFF;
@@ -387,3 +400,11 @@ SHIM(WBOOL, OpenClipboard, HWND owner) {
 SHIM(WBOOL, CloseClipboard, void) { return true; }
 SHIM(WBOOL, EmptyClipboard, void) { return true; }
 SHIM(HANDLE, SetClipboardData, UINT format, HANDLE data) { return NULL; }
+
+// The window lost focus: key-up events will not arrive, so release everything the game believes is held.
+void input_release_all(void) {
+    for (unsigned short code = 0; code < 128; code++)
+        if (g_keys[code].vk && g_key_down[g_keys[code].vk]) key_event(code, false, false);
+    g_mouse_buttons = 0;
+    for (BYTE vk = VK_LBUTTON; vk <= VK_XBUTTON2; vk++) g_key_down[vk] = false;
+}

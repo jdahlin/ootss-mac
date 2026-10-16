@@ -60,6 +60,7 @@ void post_message(Window *w, UINT message, WPARAM wparam, LPARAM lparam) {
 }
 
 - (void)windowDidResignKey:(NSNotification *)notification {
+    input_release_all();
     post_message(self.window, WM_ACTIVATE, WA_INACTIVE, 0);
     post_message(self.window, WM_KILLFOCUS, 0, 0);
     post_message(self.window, WM_ACTIVATEAPP, false, 0);

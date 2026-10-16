@@ -14,5 +14,6 @@ extern Window *g_window; // the game's only window
 
 void post_message(Window *w, UINT message, WPARAM wparam, LPARAM lparam);
 bool handle_input_event(NSEvent *event); // true if consumed as game input
+void input_release_all(void);            // releases held keys and buttons, e.g. on losing focus
 
 NSSize client_size_in_pixels(Window *w);
