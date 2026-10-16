@@ -6,7 +6,7 @@
 #   make clean | distclean
 
 CC     := clang
-ARCH   := -arch x86_64 -mmacosx-version-min=14.0
+ARCH   := -arch x86_64 -mmacosx-version-min=15.0
 CFLAGS := $(ARCH) -O2 -g -Wall -Wextra -Wno-unused-parameter -fno-builtin -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
 LDFLAGS := $(ARCH) -framework Cocoa -framework QuartzCore -framework AudioToolbox -framework CoreAudio -framework Carbon -framework Metal
 
@@ -40,6 +40,9 @@ build/obj/d3d12/%.c.o: src/d3d12/%.c $(HDRS) | $(DXH_SRC) $(MSC_SRC)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(D3D12_CFLAGS) -c $< -o $@
 
+# Apple's runtime header requires ARC and needs none of the D3D12 headers.
+build/obj/d3d12/binding.m.o: D3D12_CFLAGS := -fobjc-arc -I$(MSC_SRC)/include
+
 build/obj/d3d12/%.m.o: src/d3d12/%.m $(HDRS) | $(DXH_SRC) $(MSC_SRC)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(D3D12_CFLAGS) -c $< -o $@
@@ -56,7 +59,7 @@ build/obj/%.m.o: src/%.m $(HDRS)
 compile_commands.json: Makefile $(SRCS)
 	@printf '[\n' > $@
 	@for f in $(SRCS); do \
-	  extra=; case $$f in src/d3d12/*) extra="$(D3D12_CFLAGS)";; *.m) extra=-fobjc-arc;; esac; \
+	  extra=; case $$f in src/d3d12/binding.m) extra="-fobjc-arc -I$(MSC_SRC)/include";; src/d3d12/*) extra="$(D3D12_CFLAGS)";; *.m) extra=-fobjc-arc;; esac; \
 	  printf '  {"directory": "%s", "file": "%s", "command": "clang -isysroot %s %s %s -c %s"},\n' "$(CURDIR)" "$$f" "$$(xcrun --show-sdk-path)" "$(CFLAGS)" "$$extra" "$$f" >> $@; \
 	done
 	@sed -i '' '$$ s/},$$/}/' $@ && printf ']\n' >> $@

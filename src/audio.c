@@ -141,6 +141,9 @@ static OSStatus render(void *context, AudioUnitRenderActionFlags *flags, const A
         out[CHANNELS * i + 1] = c->ring[CHANNELS * slot + 1];
     }
     memset(out + CHANNELS * take, 0, (frames - take) * CHANNELS * sizeof(float));
+    static int muted = -1; // LOADER_MUTE=1: keep the game's audio clock running but output silence
+    if (muted < 0) muted = getenv("LOADER_MUTE") != NULL;
+    if (muted) memset(out, 0, frames * CHANNELS * sizeof(float));
     atomic_store_explicit(&c->played, played + take, memory_order_release);
     if (c->event_driven && c->event) g_set_event(c->event);
     return noErr;

@@ -1,10 +1,111 @@
-// Resources, heaps, descriptor heaps and the small state objects (root signatures, pipelines, command
-// signatures).
+// Resources, their Metal views, residency, and the GPU address map.
 #include "objects.h"
+
+// ---------------------------------------------------------------- residency
+static id<MTLResidencySet> g_residency;
+static bool g_residency_dirty;
+static pthread_mutex_t g_residency_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static id<MTLResidencySet> residency_set(void) { // lock held
+    if (!g_residency) {
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"all D3D12 allocations";
+        desc.initialCapacity = 1 << 15;
+        NSError *error = nil;
+        g_residency = [backend_mtl_device() newResidencySetWithDescriptor:desc error:&error];
+        [desc release];
+        if (!g_residency) D3D_LOG("cannot create a residency set: %s", error.localizedDescription.UTF8String);
+    }
+    return g_residency;
+}
+
+void residency_add(id<MTLAllocation> allocation) {
+    pthread_mutex_lock(&g_residency_lock);
+    [residency_set() addAllocation:allocation];
+    g_residency_dirty = true;
+    pthread_mutex_unlock(&g_residency_lock);
+}
+
+void residency_attach(Device *device, id<MTLCommandQueue> queue) {
+    pthread_mutex_lock(&g_residency_lock);
+    [queue addResidencySet:residency_set()];
+    pthread_mutex_unlock(&g_residency_lock);
+}
+
+void residency_commit(void) {
+    pthread_mutex_lock(&g_residency_lock);
+    if (g_residency_dirty) {
+        [g_residency commit];
+        g_residency_dirty = false;
+    }
+    pthread_mutex_unlock(&g_residency_lock);
+}
+
+// ---------------------------------------------------------------- GPU address map (buffers)
+typedef struct {
+    uint64_t start, end;
+    id<MTLBuffer> buffer;
+} AddressRange;
+
+static AddressRange *g_ranges;
+static size_t g_range_count, g_range_capacity;
+static pthread_mutex_t g_ranges_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void address_map_add(id<MTLBuffer> buffer) {
+    pthread_mutex_lock(&g_ranges_lock);
+    if (g_range_count == g_range_capacity) {
+        g_range_capacity = g_range_capacity ? g_range_capacity * 2 : 256;
+        g_ranges = realloc(g_ranges, g_range_capacity * sizeof *g_ranges);
+    }
+    uint64_t start = buffer.gpuAddress;
+    size_t i = g_range_count;
+    while (i > 0 && g_ranges[i - 1].start > start) {
+        g_ranges[i] = g_ranges[i - 1];
+        i--;
+    }
+    g_ranges[i] = (AddressRange){start, start + buffer.length, buffer};
+    g_range_count++;
+    pthread_mutex_unlock(&g_ranges_lock);
+}
+
+static void address_map_remove(id<MTLBuffer> buffer) {
+    pthread_mutex_lock(&g_ranges_lock);
+    for (size_t i = 0; i < g_range_count; i++) {
+        if (g_ranges[i].buffer == buffer) {
+            memmove(&g_ranges[i], &g_ranges[i + 1], (g_range_count - i - 1) * sizeof *g_ranges);
+            g_range_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_ranges_lock);
+}
+
+bool buffer_for_address(uint64_t gpu_address, id<MTLBuffer> *buffer, uint64_t *offset) {
+    bool found = false;
+    pthread_mutex_lock(&g_ranges_lock);
+    size_t lo = 0, hi = g_range_count;
+    while (lo < hi) { // last range starting at or before the address
+        size_t mid = (lo + hi) / 2;
+        if (g_ranges[mid].start <= gpu_address)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo > 0 && gpu_address < g_ranges[lo - 1].end) {
+        *buffer = g_ranges[lo - 1].buffer;
+        *offset = gpu_address - g_ranges[lo - 1].start;
+        found = true;
+    }
+    pthread_mutex_unlock(&g_ranges_lock);
+    return found;
+}
 
 // ---------------------------------------------------------------- ID3D12Resource
 static void resource_destroy(Object *o) {
     Resource *r = (Resource *)o;
+    if (r->buffer) address_map_remove(r->buffer);
+    for (int i = 0; i < r->view_count; i++) [r->views[i].texture release];
+    free(r->views);
     [r->buffer release];
     [r->texture release];
     free(r);
@@ -57,37 +158,36 @@ static Resource *resource_new(Device *device, const D3D12_RESOURCE_DESC *desc, D
     r->object.destroy = resource_destroy;
     r->desc = *desc;
     r->heap_type = heap_type;
+    pthread_mutex_init(&r->views_lock, NULL);
     return r;
 }
 
-static MTLTextureDescriptor *texture_descriptor(const D3D12_RESOURCE_DESC *desc) {
-    MTLTextureDescriptor *t = [MTLTextureDescriptor new];
-    t.pixelFormat = mtl_format(desc->Format);
-    t.width = desc->Width;
-    t.height = desc->Height;
-    t.mipmapLevelCount = desc->MipLevels ? desc->MipLevels : 1;
-    t.sampleCount = desc->SampleDesc.Count ? desc->SampleDesc.Count : 1;
+// ---------------------------------------------------------------- textures
+static bool has_flag(const D3D12_RESOURCE_DESC *d, D3D12_RESOURCE_FLAGS f) { return (d->Flags & f) != 0; }
+
+static MTLTextureType texture_type(const D3D12_RESOURCE_DESC *d) {
+    if (d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) return MTLTextureType3D;
+    if (d->SampleDesc.Count > 1)
+        return d->DepthOrArraySize > 1 ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample;
+    return MTLTextureType2DArray; // 1D and 2D textures are all arrays, as the converted shaders expect
+}
+
+static MTLTextureDescriptor *texture_descriptor(const D3D12_RESOURCE_DESC *d, MTLPixelFormat format) {
+    MTLTextureDescriptor *t = [[MTLTextureDescriptor alloc] init];
+    t.textureType = texture_type(d);
+    t.pixelFormat = format;
+    t.width = d->Width;
+    t.height = d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1 : d->Height;
+    t.depth = d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? d->DepthOrArraySize : 1;
+    t.arrayLength = d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : MAX(d->DepthOrArraySize, 1);
+    t.mipmapLevelCount = d->MipLevels ? d->MipLevels : 1;
+    t.sampleCount = d->SampleDesc.Count ? d->SampleDesc.Count : 1;
     t.storageMode = MTLStorageModePrivate;
+    t.hazardTrackingMode = MTLHazardTrackingModeUntracked;
     t.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-    if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+    if (has_flag(d, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) || has_flag(d, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
         t.usage |= MTLTextureUsageRenderTarget;
-    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) t.usage |= MTLTextureUsageShaderWrite;
-    switch (desc->Dimension) {
-    case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
-        t.textureType = desc->DepthOrArraySize > 1 ? MTLTextureType1DArray : MTLTextureType1D;
-        t.arrayLength = desc->DepthOrArraySize;
-        break;
-    case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
-        t.textureType = MTLTextureType3D;
-        t.depth = desc->DepthOrArraySize;
-        break;
-    default: // TEXTURE2D
-        t.textureType = t.sampleCount > 1            ? MTLTextureType2DMultisample
-                        : desc->DepthOrArraySize > 1 ? MTLTextureType2DArray
-                                                     : MTLTextureType2D;
-        t.arrayLength = desc->DepthOrArraySize;
-        break;
-    }
+    if (has_flag(d, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) t.usage |= MTLTextureUsageShaderWrite;
     return t;
 }
 
@@ -95,11 +195,19 @@ HRESULT resource_create(Device *device, const D3D12_HEAP_PROPERTIES *heap, const
                         void **out) {
     Resource *r = resource_new(device, desc, heap ? heap->Type : D3D12_HEAP_TYPE_DEFAULT);
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        r->buffer = [device->mtl newBufferWithLength:desc->Width options:MTLResourceStorageModeShared];
+        r->buffer =
+            [device->mtl newBufferWithLength:MAX(desc->Width, 1)
+                                     options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+        if (r->buffer) {
+            address_map_add(r->buffer);
+            residency_add(r->buffer);
+        }
     } else {
-        MTLTextureDescriptor *t = texture_descriptor(desc);
+        r->pixel_format = mtl_resource_format(desc);
+        MTLTextureDescriptor *t = texture_descriptor(desc, r->pixel_format);
         r->texture = [device->mtl newTextureWithDescriptor:t];
         [t release];
+        if (r->texture) residency_add(r->texture);
     }
     if (!r->buffer && !r->texture) {
         D3D_LOG("could not create resource (dimension %d, %llu x %u, format %d)", desc->Dimension,
@@ -121,7 +229,7 @@ Resource *resource_from_texture(Device *device, id<MTLTexture> texture, DXGI_FOR
         .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         .Width = texture.width,
         .Height = (UINT)texture.height,
-        .DepthOrArraySize = 1,
+        .DepthOrArraySize = (UINT16)texture.arrayLength,
         .MipLevels = 1,
         .Format = format,
         .SampleDesc = {1, 0},
@@ -129,7 +237,49 @@ Resource *resource_from_texture(Device *device, id<MTLTexture> texture, DXGI_FOR
     };
     Resource *r = resource_new(device, &desc, D3D12_HEAP_TYPE_DEFAULT);
     r->texture = [texture retain];
+    r->pixel_format = texture.pixelFormat;
+    residency_add(texture);
     return r;
+}
+
+// Views are keyed by every property that changes the view; a view of the whole texture is the texture.
+id<MTLTexture> resource_view(Resource *r, MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices) {
+    id<MTLTexture> base = r->texture;
+    // Depth formats cannot be reinterpreted as color; only the stencil plane has a view format of its own.
+    bool stencil_view = format == MTLPixelFormatX32_Stencil8 || format == MTLPixelFormatX24_Stencil8;
+    bool depth_base = base.pixelFormat == MTLPixelFormatDepth16Unorm ||
+                      base.pixelFormat == MTLPixelFormatDepth32Float ||
+                      base.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ||
+                      base.pixelFormat == MTLPixelFormatDepth24Unorm_Stencil8;
+    if (depth_base && !stencil_view) format = base.pixelFormat;
+    if (format == base.pixelFormat && type == base.textureType && levels.location == 0 &&
+        levels.length == base.mipmapLevelCount && slices.location == 0 &&
+        (slices.length == base.arrayLength || type == MTLTextureType3D))
+        return base;
+
+    uint64_t key = (uint64_t)format | (uint64_t)type << 16 | (uint64_t)levels.location << 24 |
+                   (uint64_t)levels.length << 32 | (uint64_t)slices.location << 40 | (uint64_t)slices.length << 52;
+    pthread_mutex_lock(&r->views_lock);
+    for (int i = 0; i < r->view_count; i++) {
+        if (r->views[i].key == key) {
+            id<MTLTexture> hit = r->views[i].texture;
+            pthread_mutex_unlock(&r->views_lock);
+            return hit;
+        }
+    }
+    id<MTLTexture> view = [base newTextureViewWithPixelFormat:format textureType:type levels:levels slices:slices];
+    if (!view)
+        D3D_TODO("cannot view texture (format %lu, type %lu, %lu levels, %lu slices)", (unsigned long)format,
+                 (unsigned long)type, (unsigned long)levels.length, (unsigned long)slices.length);
+    if (view) {
+        if (r->view_count == r->view_capacity) {
+            r->view_capacity = r->view_capacity ? r->view_capacity * 2 : 4;
+            r->views = realloc(r->views, r->view_capacity * sizeof *r->views);
+        }
+        r->views[r->view_count++] = (TextureView){key, view};
+    }
+    pthread_mutex_unlock(&r->views_lock);
+    return view;
 }
 
 // ---------------------------------------------------------------- copyable footprints
@@ -179,16 +329,6 @@ static ID3D12HeapVtbl heap_vtbl = {ID3D12_OBJECT_METHODS, .GetDevice = (void *)c
 static const IID *const heap_iids[] = {&IID_ID3D12Heap, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object,
                                        NULL};
 
-static HRESULT give(Object *o, REFIID iid, void **out) {
-    if (!out) {
-        object_release(o);
-        return S_FALSE;
-    }
-    HRESULT hr = object_query(o, iid, out);
-    object_release(o);
-    return hr;
-}
-
 static void free_object(Object *o) { free(o); }
 
 HRESULT heap_create(Device *device, const D3D12_HEAP_DESC *desc, REFIID iid, void **out) {
@@ -198,124 +338,7 @@ HRESULT heap_create(Device *device, const D3D12_HEAP_DESC *desc, REFIID iid, voi
     object_init(&h->object, &heap_vtbl, heap_iids, device);
     h->object.destroy = free_object;
     h->desc = *desc;
-    return give(&h->object, iid, out);
-}
-
-// ---------------------------------------------------------------- ID3D12DescriptorHeap
-static uint64_t g_next_gpu_descriptor_base = 0x100000000000ull; // GPU handles are opaque to the game
-
-static void descriptor_heap_destroy(Object *o) {
-    free(((DescriptorHeap *)o)->descriptors);
-    free(o);
-}
-
-static D3D12_DESCRIPTOR_HEAP_DESC *STDMETHODCALLTYPE descriptor_heap_GetDesc(DescriptorHeap *h,
-                                                                             D3D12_DESCRIPTOR_HEAP_DESC *ret) {
-    *ret = h->desc;
-    return ret;
-}
-
-static D3D12_CPU_DESCRIPTOR_HANDLE *STDMETHODCALLTYPE descriptor_heap_GetCPUStart(DescriptorHeap *h,
-                                                                                  D3D12_CPU_DESCRIPTOR_HANDLE *ret) {
-    ret->ptr = (SIZE_T)h->descriptors;
-    return ret;
-}
-
-static D3D12_GPU_DESCRIPTOR_HANDLE *STDMETHODCALLTYPE descriptor_heap_GetGPUStart(DescriptorHeap *h,
-                                                                                  D3D12_GPU_DESCRIPTOR_HANDLE *ret) {
-    ret->ptr = h->gpu_base;
-    return ret;
-}
-
-static ID3D12DescriptorHeapVtbl descriptor_heap_vtbl = {
-    ID3D12_OBJECT_METHODS,
-    .GetDevice = (void *)com_GetDevice,
-    .GetDesc = (void *)descriptor_heap_GetDesc,
-    .GetCPUDescriptorHandleForHeapStart = (void *)descriptor_heap_GetCPUStart,
-    .GetGPUDescriptorHandleForHeapStart = (void *)descriptor_heap_GetGPUStart,
-};
-static const IID *const descriptor_heap_iids[] = {&IID_ID3D12DescriptorHeap, &IID_ID3D12Pageable,
-                                                  &IID_ID3D12DeviceChild, &IID_ID3D12Object, NULL};
-
-HRESULT descriptor_heap_create(Device *device, const D3D12_DESCRIPTOR_HEAP_DESC *desc, REFIID iid, void **out) {
-    static bool vtbl_ready;
-    if (!vtbl_ready++) FILL_UNIMPLEMENTED(descriptor_heap_vtbl);
-    DescriptorHeap *h = calloc(1, sizeof *h);
-    object_init(&h->object, &descriptor_heap_vtbl, descriptor_heap_iids, device);
-    h->object.destroy = descriptor_heap_destroy;
-    h->desc = *desc;
-    h->descriptors = calloc(desc->NumDescriptors ? desc->NumDescriptors : 1, DESCRIPTOR_SIZE);
-    if (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
-        h->gpu_base = g_next_gpu_descriptor_base;
-        g_next_gpu_descriptor_base += ((uint64_t)desc->NumDescriptors * DESCRIPTOR_SIZE + 0xffff) & ~0xffffull;
-    }
-    return give(&h->object, iid, out);
-}
-
-// ---------------------------------------------------------------- root signatures, pipelines, command signatures
-static void root_signature_destroy(Object *o) {
-    free(((RootSignature *)o)->blob);
-    free(o);
-}
-
-static ID3D12RootSignatureVtbl root_signature_vtbl = {ID3D12_OBJECT_METHODS, .GetDevice = (void *)com_GetDevice};
-static const IID *const root_signature_iids[] = {&IID_ID3D12RootSignature, &IID_ID3D12DeviceChild, &IID_ID3D12Object,
-                                                 NULL};
-
-HRESULT root_signature_create(Device *device, const void *blob, size_t size, REFIID iid, void **out) {
-    RootSignature *r = calloc(1, sizeof *r);
-    object_init(&r->object, &root_signature_vtbl, root_signature_iids, device);
-    r->object.destroy = root_signature_destroy;
-    r->blob = malloc(size);
-    memcpy(r->blob, blob, size);
-    r->blob_size = size;
-    return give(&r->object, iid, out);
-}
-
-static HRESULT STDMETHODCALLTYPE pipeline_GetCachedBlob(PipelineState *p, void **blob) {
-    *blob = NULL;
-    return E_NOTIMPL;
-}
-
-static ID3D12PipelineStateVtbl pipeline_state_vtbl = {ID3D12_OBJECT_METHODS, .GetDevice = (void *)com_GetDevice,
-                                                      .GetCachedBlob = (void *)pipeline_GetCachedBlob};
-static const IID *const pipeline_state_iids[] = {&IID_ID3D12PipelineState, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild,
-                                                 &IID_ID3D12Object, NULL};
-
-static void pipeline_state_destroy(Object *o) {
-    PipelineState *p = (PipelineState *)o;
-    for (int i = 0; i < p->stage_count; i++) {
-        [p->libraries[i] release];
-        [p->functions[i] release];
-    }
-    free(p);
-}
-
-HRESULT pipeline_state_create(Device *device, bool compute, const D3D12_SHADER_BYTECODE *const *stages, int count,
-                              REFIID iid, void **out) {
-    PipelineState *p = calloc(1, sizeof *p);
-    object_init(&p->object, &pipeline_state_vtbl, pipeline_state_iids, device);
-    p->object.destroy = pipeline_state_destroy;
-    p->compute = compute;
-    for (int i = 0; i < count && p->stage_count < MAX_PIPELINE_STAGES; i++) {
-        if (!stages[i]->pShaderBytecode) continue; // unused stage
-        NSString *function = nil;
-        id<MTLLibrary> library = shader_library_create(device->mtl, stages[i], &function);
-        if (!library) continue; // already logged; the pipeline stays unusable but creation succeeds
-        p->libraries[p->stage_count] = library;
-        p->functions[p->stage_count++] = [function retain];
-    }
-    return give(&p->object, iid, out);
-}
-
-static ID3D12CommandSignatureVtbl command_signature_vtbl = {ID3D12_OBJECT_METHODS, .GetDevice = (void *)com_GetDevice};
-static const IID *const command_signature_iids[] = {&IID_ID3D12CommandSignature, &IID_ID3D12Pageable,
-                                                    &IID_ID3D12DeviceChild, &IID_ID3D12Object, NULL};
-
-HRESULT command_signature_create(Device *device, const D3D12_COMMAND_SIGNATURE_DESC *desc, REFIID iid, void **out) {
-    CommandSignature *c = calloc(1, sizeof *c);
-    object_init(&c->object, &command_signature_vtbl, command_signature_iids, device);
-    c->object.destroy = free_object;
-    c->desc = *desc; // pArgumentDescs is not copied yet (indirect execution is not implemented)
-    return give(&c->object, iid, out);
+    HRESULT hr = object_query(&h->object, iid, out);
+    object_release(&h->object);
+    return hr;
 }

@@ -64,6 +64,7 @@ game is stored in this repository or in the build.
 | Variable | Effect |
 | --- | --- |
 | `LOADER_FPS=1` | Show fps and frame time in the window title |
+| `LOADER_MUTE=1` | Play no sound (the game's audio clock keeps running) |
 | `LOADER_DISPLAY=native` | Report the real screen resolution to the game instead of the window size |
 | `LOADER_TRACE=1` | Log Win32 calls (verbose) |
 | `DMN_VSYNC=1` | Sync presentation to the display (off by default for lower input latency) |

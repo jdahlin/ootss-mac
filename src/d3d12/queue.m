@@ -58,15 +58,32 @@ HRESULT fence_create(Device *device, UINT64 initial, REFIID iid, void **out) {
 
 // ---------------------------------------------------------------- ID3D12CommandQueue
 static void queue_destroy(Object *o) {
+    [((CommandQueue *)o)->fence release];
     [((CommandQueue *)o)->mtl release];
     free(o);
+}
+
+// At most this many command buffers are in flight, so a game that runs ahead cannot queue unbounded GPU work.
+#define MAX_COMMAND_BUFFERS_IN_FLIGHT 8
+
+static void commit(id<MTLCommandBuffer> cb) {
+    static dispatch_semaphore_t in_flight;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ in_flight = dispatch_semaphore_create(MAX_COMMAND_BUFFERS_IN_FLIGHT); });
+    dispatch_semaphore_wait(in_flight, DISPATCH_TIME_FOREVER);
+    residency_commit();
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      dispatch_semaphore_signal(in_flight);
+      if (done.error) D3D_LOG("command buffer failed: %s", done.error.localizedDescription.UTF8String);
+    }];
+    [cb commit];
 }
 
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(CommandQueue *q, UINT count, ID3D12CommandList *const *lists) {
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [q->mtl commandBuffer];
-        for (UINT i = 0; i < count; i++) command_list_execute((CommandList *)lists[i], cb);
-        [cb commit];
+        for (UINT i = 0; i < count; i++) command_list_execute((CommandList *)lists[i], q, cb);
+        commit(cb);
     }
 }
 
@@ -128,6 +145,8 @@ HRESULT command_queue_create(Device *device, const D3D12_COMMAND_QUEUE_DESC *des
     q->object.destroy = queue_destroy;
     q->desc = *desc;
     q->mtl = [device->mtl newCommandQueueWithMaxCommandBufferCount:256];
+    q->fence = [device->mtl newFence];
+    residency_attach(device, q->mtl);
     HRESULT hr = object_query(&q->object, iid, out);
     object_release(&q->object);
     return hr;

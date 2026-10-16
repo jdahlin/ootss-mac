@@ -6,94 +6,34 @@
 //
 // The converter library is loaded with dlopen (next to the executable, or LOADER_MSC_LIB), so the
 // game still starts, with a clear message, when it is missing.
+#include <ctype.h>
 #include <dlfcn.h>
 #include <libgen.h>
 #include <mach-o/dyld.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "converter.h"
 #include "objects.h"
-#import <dispatch/dispatch.h>
-#include <metal_irconverter/metal_irconverter.h>
 
-// ---------------------------------------------------------------- the converter library
-static struct {
-    IRCompiler *(*CompilerCreate)(void);
-    void (*CompilerDestroy)(IRCompiler *);
-    IRObject *(*ObjectCreateFromDXIL)(const uint8_t *, size_t, IRBytecodeOwnership);
-    void (*ObjectDestroy)(IRObject *);
-    IRObject *(*CompilerAllocCompileAndLink)(IRCompiler *, const char *, const IRObject *, IRError **);
-    IRShaderStage (*ObjectGetMetalIRShaderStage)(const IRObject *);
-    IRMetalLibBinary *(*MetalLibBinaryCreate)(void);
-    void (*MetalLibBinaryDestroy)(IRMetalLibBinary *);
-    bool (*ObjectGetMetalLibBinary)(const IRObject *, IRShaderStage, IRMetalLibBinary *);
-    size_t (*MetalLibGetBytecodeSize)(const IRMetalLibBinary *);
-    size_t (*MetalLibGetBytecode)(const IRMetalLibBinary *, uint8_t *);
-    uint32_t (*ErrorGetCode)(const IRError *);
-    void (*ErrorDestroy)(IRError *);
-    void (*CompilerSetMinimumDeploymentTarget)(IRCompiler *, IROperatingSystem, const char *);
-} ir;
-
+static ConverterAPI g_api;
 static char g_cache_dir[1024]; // empty: caching disabled
-static bool g_converter_ready;
 static atomic_uint g_converted, g_cached, g_failed;
 static atomic_uint_fast64_t g_convert_nanoseconds;
 
-static bool load_converter(void) {
-    char exe[1024], path[1100];
-    uint32_t size = sizeof exe;
-    _NSGetExecutablePath(exe, &size);
-    const char *override = getenv("LOADER_MSC_LIB");
-    const char *candidates[] = {override, NULL, NULL};
-    snprintf(path, sizeof path, "%s/libmetalirconverter.dylib", dirname(exe));
-    candidates[1] = path;
-
-    void *lib = NULL;
-    for (int i = 0; i < 2 && !lib; i++)
-        if (candidates[i]) lib = dlopen(candidates[i], RTLD_NOW);
-    if (!lib) {
-        D3D_LOG("shader converter not found (run `make msc`, or set LOADER_MSC_LIB): %s", dlerror());
-        return false;
-    }
-#define LOAD(field, name) (ir.field = dlsym(lib, "IR" name))
-    LOAD(CompilerCreate, "CompilerCreate");
-    LOAD(CompilerDestroy, "CompilerDestroy");
-    LOAD(ObjectCreateFromDXIL, "ObjectCreateFromDXIL");
-    LOAD(ObjectDestroy, "ObjectDestroy");
-    LOAD(CompilerAllocCompileAndLink, "CompilerAllocCompileAndLink");
-    LOAD(ObjectGetMetalIRShaderStage, "ObjectGetMetalIRShaderStage");
-    LOAD(MetalLibBinaryCreate, "MetalLibBinaryCreate");
-    LOAD(MetalLibBinaryDestroy, "MetalLibBinaryDestroy");
-    LOAD(ObjectGetMetalLibBinary, "ObjectGetMetalLibBinary");
-    LOAD(MetalLibGetBytecodeSize, "MetalLibGetBytecodeSize");
-    LOAD(MetalLibGetBytecode, "MetalLibGetBytecode");
-    LOAD(ErrorGetCode, "ErrorGetCode");
-    LOAD(ErrorDestroy, "ErrorDestroy");
-    LOAD(CompilerSetMinimumDeploymentTarget, "CompilerSetMinimumDeploymentTarget");
-#undef LOAD
-    void **slots = (void **)&ir;
-    for (size_t i = 0; i < sizeof ir / sizeof *slots; i++)
-        if (!slots[i]) {
-            D3D_LOG("shader converter library is missing an entry point (slot %zu)", i);
-            return false;
-        }
-
-    // The cache directory is keyed by the converter build: its output changes with the library.
+// ---------------------------------------------------------------- loading
+static void make_cache_directory(const char *library_path) {
     struct stat st = {0};
-    Dl_info info;
-    if (dladdr((void *)dlsym(lib, "IRCompilerCreate"), &info)) stat(info.dli_fname, &st);
+    stat(library_path, &st);
     const char *home = getenv("HOME");
-    if (home) {
-        snprintf(g_cache_dir, sizeof g_cache_dir, "%s/Library/Caches/ootss-mac/shaders/msc-%lld", home,
-                 (long long)st.st_size);
-        char parent[1024];
-        snprintf(parent, sizeof parent, "%s/Library/Caches/ootss-mac", home);
-        mkdir(parent, 0755);
-        snprintf(parent, sizeof parent, "%s/Library/Caches/ootss-mac/shaders", home);
-        mkdir(parent, 0755);
-        if (mkdir(g_cache_dir, 0755) && access(g_cache_dir, W_OK)) g_cache_dir[0] = 0;
-    }
-    D3D_LOG("shader converter: %s, cache: %s", info.dli_fname, g_cache_dir[0] ? g_cache_dir : "(disabled)");
-    return true;
+    if (!home) return;
+    char path[1024];
+    // The cache is keyed by the converter build: its output changes with the library.
+    snprintf(path, sizeof path, "%s/Library/Caches/ootss-mac", home);
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/Library/Caches/ootss-mac/shaders", home);
+    mkdir(path, 0755);
+    snprintf(g_cache_dir, sizeof g_cache_dir, "%s/msc-%lld", path, (long long)st.st_size);
+    if (mkdir(g_cache_dir, 0755) && access(g_cache_dir, W_OK)) g_cache_dir[0] = 0;
 }
 
 // Prints the totals when they changed since the last call.
@@ -107,10 +47,84 @@ static void print_shader_stats(void) {
             atomic_load(&g_convert_nanoseconds) / 1e9, cached, failed);
 }
 
-// ---------------------------------------------------------------- conversion with cache
-static NSData *read_file(const char *path) { return [NSData dataWithContentsOfFile:@(path)]; }
+static bool load_converter(void) {
+    char exe[1024], beside[1100];
+    uint32_t size = sizeof exe;
+    _NSGetExecutablePath(exe, &size);
+    snprintf(beside, sizeof beside, "%s/libmetalirconverter.dylib", dirname(exe));
+    const char *candidates[] = {getenv("LOADER_MSC_LIB"), beside};
 
-static void write_cache(const char *path, const uint8_t *bytes, size_t size) {
+    void *lib = NULL;
+    const char *path = NULL;
+    for (int i = 0; i < 2 && !lib; i++)
+        if (candidates[i] && (lib = dlopen(candidates[i], RTLD_NOW))) path = candidates[i];
+    if (!lib) {
+        D3D_LOG("shader converter not found (run `make msc`, or set LOADER_MSC_LIB): %s", dlerror());
+        return false;
+    }
+#define LOAD(field, name) (g_api.field = dlsym(lib, "IR" name))
+    LOAD(CompilerCreate, "CompilerCreate");
+    LOAD(CompilerDestroy, "CompilerDestroy");
+    LOAD(CompilerSetMinimumDeploymentTarget, "CompilerSetMinimumDeploymentTarget");
+    LOAD(CompilerSetGlobalRootSignature, "CompilerSetGlobalRootSignature");
+    LOAD(ObjectCreateFromDXIL, "ObjectCreateFromDXIL");
+    LOAD(ObjectDestroy, "ObjectDestroy");
+    LOAD(CompilerAllocCompileAndLink, "CompilerAllocCompileAndLink");
+    LOAD(ObjectGetMetalIRShaderStage, "ObjectGetMetalIRShaderStage");
+    LOAD(MetalLibBinaryCreate, "MetalLibBinaryCreate");
+    LOAD(MetalLibBinaryDestroy, "MetalLibBinaryDestroy");
+    LOAD(ObjectGetMetalLibBinary, "ObjectGetMetalLibBinary");
+    LOAD(MetalLibGetBytecodeSize, "MetalLibGetBytecodeSize");
+    LOAD(MetalLibGetBytecode, "MetalLibGetBytecode");
+    LOAD(ErrorGetCode, "ErrorGetCode");
+    LOAD(ErrorDestroy, "ErrorDestroy");
+    LOAD(ShaderReflectionCreate, "ShaderReflectionCreate");
+    LOAD(ShaderReflectionDestroy, "ShaderReflectionDestroy");
+    LOAD(ObjectGetReflection, "ObjectGetReflection");
+    LOAD(ShaderReflectionCopyVertexInfo, "ShaderReflectionCopyVertexInfo");
+    LOAD(ShaderReflectionReleaseVertexInfo, "ShaderReflectionReleaseVertexInfo");
+    LOAD(ShaderReflectionCopyComputeInfo, "ShaderReflectionCopyComputeInfo");
+    LOAD(ShaderReflectionReleaseComputeInfo, "ShaderReflectionReleaseComputeInfo");
+    LOAD(RootSignatureCreateFromDescriptor, "RootSignatureCreateFromDescriptor");
+    LOAD(RootSignatureDestroy, "RootSignatureDestroy");
+    LOAD(RootSignatureGetResourceCount, "RootSignatureGetResourceCount");
+    LOAD(RootSignatureGetResourceLocations, "RootSignatureGetResourceLocations");
+#undef LOAD
+    void **slots = (void **)&g_api;
+    for (size_t i = 0; i < sizeof g_api / sizeof *slots; i++)
+        if (!slots[i]) {
+            D3D_LOG("shader converter library is missing an entry point (slot %zu)", i);
+            return false;
+        }
+
+    make_cache_directory(path);
+    D3D_LOG("shader converter: %s, cache: %s", path, g_cache_dir[0] ? g_cache_dir : "(disabled)");
+    atexit(print_shader_stats);
+    // Progress while the game builds its pipelines; the totals print only when they change.
+    dispatch_source_t timer =
+        dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
+    dispatch_source_set_event_handler(timer, ^{ print_shader_stats(); });
+    dispatch_resume(timer);
+    return true;
+}
+
+const ConverterAPI *converter(void) {
+    static dispatch_once_t once;
+    static bool ready;
+    dispatch_once(&once, ^{ ready = load_converter(); });
+    return ready ? &g_api : NULL;
+}
+
+// ---------------------------------------------------------------- cache
+// Each shader is two files named after the container hash: <hash>.metallib and <hash>.info (reflection).
+static void cache_path(const uint8_t *dxbc, uint64_t root_key, const char *extension, char *out, size_t size) {
+    int n = snprintf(out, size, "%s/", g_cache_dir);
+    for (int i = 4; i < 20; i++) n += snprintf(out + n, size - n, "%02x", dxbc[i]);
+    snprintf(out + n, size - n, "-%016llx.%s", (unsigned long long)root_key, extension);
+}
+
+static void write_cache(const char *path, const void *bytes, size_t size) {
     char temp[1100];
     snprintf(temp, sizeof temp, "%s.%d.tmp", path, getpid());
     FILE *f = fopen(temp, "wb");
@@ -123,68 +137,91 @@ static void write_cache(const char *path, const uint8_t *bytes, size_t size) {
         unlink(temp);
 }
 
+// ---------------------------------------------------------------- reflection
+static void collect_info(const IRObject *object, IRShaderStage stage, ShaderInfo *info) {
+    memset(info, 0, sizeof *info);
+    IRShaderReflection *reflection = g_api.ShaderReflectionCreate();
+    if (g_api.ObjectGetReflection(object, stage, reflection)) {
+        if (stage == IRShaderStageVertex) {
+            IRVersionedVSInfo vs;
+            if (g_api.ShaderReflectionCopyVertexInfo(reflection, IRReflectionVersion_1_0, &vs)) {
+                const IRVSInfo_1_0 *v = &vs.info_1_0;
+                for (size_t i = 0; i < v->num_vertex_inputs && info->input_count < 16; i++) {
+                    snprintf(info->inputs[info->input_count].name, sizeof info->inputs[0].name, "%s",
+                             v->vertex_inputs[i].name);
+                    info->inputs[info->input_count++].attribute = v->vertex_inputs[i].attributeIndex;
+                }
+                g_api.ShaderReflectionReleaseVertexInfo(&vs);
+            }
+        } else if (stage == IRShaderStageCompute) {
+            IRVersionedCSInfo cs;
+            if (g_api.ShaderReflectionCopyComputeInfo(reflection, IRReflectionVersion_1_0, &cs)) {
+                memcpy(info->threads_per_group, cs.info_1_0.tg_size, sizeof info->threads_per_group);
+                g_api.ShaderReflectionReleaseComputeInfo(&cs);
+            }
+        }
+    }
+    g_api.ShaderReflectionDestroy(reflection);
+}
+
+// ---------------------------------------------------------------- conversion
 // The container's hash (bytes 4..20) identifies the shader; the same hash always yields the same output.
-static NSData *convert(const D3D12_SHADER_BYTECODE *code) {
+static NSData *convert(const D3D12_SHADER_BYTECODE *code, const RootSignature *root, ShaderInfo *info) {
     const uint8_t *dxbc = code->pShaderBytecode;
-    char cache_path[1100] = "";
+    char library_path[1100] = "", info_path[1100] = "";
     if (g_cache_dir[0]) {
-        int n = snprintf(cache_path, sizeof cache_path, "%s/", g_cache_dir);
-        for (int i = 4; i < 20; i++) n += snprintf(cache_path + n, sizeof cache_path - n, "%02x", dxbc[i]);
-        snprintf(cache_path + n, sizeof cache_path - n, ".metallib");
-        NSData *hit = read_file(cache_path);
-        if (hit) {
+        cache_path(dxbc, root ? root->key : 0, "metallib", library_path, sizeof library_path);
+        cache_path(dxbc, root ? root->key : 0, "info", info_path, sizeof info_path);
+        NSData *library = [NSData dataWithContentsOfFile:@(library_path)];
+        NSData *stored = [NSData dataWithContentsOfFile:@(info_path)];
+        if (library && stored.length == sizeof *info) {
+            memcpy(info, stored.bytes, sizeof *info);
             atomic_fetch_add(&g_cached, 1);
-            return hit;
+            return library;
         }
     }
 
     uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    IRCompiler *compiler = ir.CompilerCreate();
-    ir.CompilerSetMinimumDeploymentTarget(compiler, IROperatingSystem_macOS, "14.0");
-    IRObject *input = ir.ObjectCreateFromDXIL(dxbc, code->BytecodeLength, IRBytecodeOwnershipNone);
+    IRCompiler *compiler = g_api.CompilerCreate();
+    g_api.CompilerSetMinimumDeploymentTarget(compiler, IROperatingSystem_macOS, "14.0");
+    if (root && root->ir) g_api.CompilerSetGlobalRootSignature(compiler, root->ir);
+    IRObject *input = g_api.ObjectCreateFromDXIL(dxbc, code->BytecodeLength, IRBytecodeOwnershipNone);
     IRError *error = NULL;
-    IRObject *output = ir.CompilerAllocCompileAndLink(compiler, NULL, input, &error);
+    IRObject *output = g_api.CompilerAllocCompileAndLink(compiler, NULL, input, &error);
     NSData *result = nil;
     if (output) {
-        IRMetalLibBinary *lib = ir.MetalLibBinaryCreate();
-        if (ir.ObjectGetMetalLibBinary(output, ir.ObjectGetMetalIRShaderStage(output), lib)) {
-            size_t size = ir.MetalLibGetBytecodeSize(lib);
+        IRShaderStage stage = g_api.ObjectGetMetalIRShaderStage(output);
+        IRMetalLibBinary *lib = g_api.MetalLibBinaryCreate();
+        if (g_api.ObjectGetMetalLibBinary(output, stage, lib)) {
+            size_t size = g_api.MetalLibGetBytecodeSize(lib);
             uint8_t *bytes = malloc(size);
-            ir.MetalLibGetBytecode(lib, bytes);
-            if (cache_path[0]) write_cache(cache_path, bytes, size);
+            g_api.MetalLibGetBytecode(lib, bytes);
+            collect_info(output, stage, info);
+            if (library_path[0]) {
+                write_cache(library_path, bytes, size);
+                write_cache(info_path, info, sizeof *info);
+            }
             result = [NSData dataWithBytesNoCopy:bytes length:size freeWhenDone:YES];
         }
-        ir.MetalLibBinaryDestroy(lib);
-        ir.ObjectDestroy(output);
+        g_api.MetalLibBinaryDestroy(lib);
+        g_api.ObjectDestroy(output);
     }
     if (error) {
-        D3D_LOG("shader conversion failed (code %u)", ir.ErrorGetCode(error));
-        ir.ErrorDestroy(error);
+        D3D_LOG("shader conversion failed (code %u)", g_api.ErrorGetCode(error));
+        g_api.ErrorDestroy(error);
     }
-    ir.ObjectDestroy(input);
-    ir.CompilerDestroy(compiler);
+    g_api.ObjectDestroy(input);
+    g_api.CompilerDestroy(compiler);
     atomic_fetch_add(&g_convert_nanoseconds, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start);
     atomic_fetch_add(result ? &g_converted : &g_failed, 1);
     return result;
 }
 
-// Returns a retained MTLLibrary and its (single) function name, or nil.
-id<MTLLibrary> shader_library_create(id<MTLDevice> device, const D3D12_SHADER_BYTECODE *code, NSString **function) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-      g_converter_ready = load_converter();
-      if (!g_converter_ready) return;
-      atexit(print_shader_stats);
-      // Progress while the game builds its pipelines; the totals print only when they change.
-      dispatch_source_t timer =
-          dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-      dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
-      dispatch_source_set_event_handler(timer, ^{ print_shader_stats(); });
-      dispatch_resume(timer);
-    });
-    if (!g_converter_ready || !code->pShaderBytecode || code->BytecodeLength < 32) return nil;
-
-    NSData *metallib = convert(code);
+// Returns a retained MTLLibrary, its (single) function name and reflection, or nil.
+id<MTLLibrary> shader_library_create(id<MTLDevice> device, const D3D12_SHADER_BYTECODE *code, const RootSignature *root,
+                                     NSString **function, ShaderInfo *info) {
+    if (!converter() || !code->pShaderBytecode || code->BytecodeLength < 32) return nil;
+    NSData *metallib = convert(code, root, info);
     if (!metallib) return nil;
     NSError *error = nil;
     dispatch_data_t data =

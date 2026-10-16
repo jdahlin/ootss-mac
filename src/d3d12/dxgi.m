@@ -199,12 +199,14 @@ static void swapchain_create_buffers(SwapChain *s) {
                                                                                  width:s->desc.Width
                                                                                 height:s->desc.Height
                                                                              mipmapped:NO];
-    t.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    t.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+              MTLTextureUsagePixelFormatView;
     t.storageMode = MTLStorageModePrivate;
     for (UINT i = 0; i < s->desc.BufferCount && i < 16; i++) {
         if (s->buffers[i]) object_release(&s->buffers[i]->object);
         id<MTLTexture> texture = [s->queue->object.device->mtl newTextureWithDescriptor:t];
         s->buffers[i] = resource_from_texture(s->queue->object.device, texture, s->desc.Format);
+        s->buffers[i]->is_backbuffer = true;
         [texture release];
     }
     s->layer.drawableSize = CGSizeMake(s->desc.Width, s->desc.Height);
@@ -228,13 +230,52 @@ static HRESULT STDMETHODCALLTYPE swapchain_Present(SwapChain *s, UINT sync_inter
                  destinationSlice:0
                  destinationLevel:0
                 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            // D3D12_LOG_PRESENT=1: report how much of the back buffer is non-black (BGRA8 only).
+            id<MTLBuffer> probe = nil;
+            if (getenv("D3D12_LOG_PRESENT") && s->presents % 20 == 0 &&
+                source.pixelFormat == MTLPixelFormatBGRA8Unorm) {
+                probe = [s->queue->object.device->mtl newBufferWithLength:source.width * source.height * 4
+                                                                  options:MTLResourceStorageModeShared];
+                [blit copyFromTexture:source
+                                 sourceSlice:0
+                                 sourceLevel:0
+                                sourceOrigin:MTLOriginMake(0, 0, 0)
+                                  sourceSize:MTLSizeMake(source.width, source.height, 1)
+                                    toBuffer:probe
+                           destinationOffset:0
+                      destinationBytesPerRow:source.width * 4
+                    destinationBytesPerImage:source.width * source.height * 4];
+            }
             [blit endEncoding];
             [cb presentDrawable:drawable];
             [cb commit];
+            if (probe) {
+                [cb waitUntilCompleted];
+                const uint8_t *px = probe.contents;
+                size_t lit = 0, n = source.width * source.height;
+                for (size_t i = 0; i < n; i++) lit += (px[i * 4] | px[i * 4 + 1] | px[i * 4 + 2]) != 0;
+                const char *dump = getenv("D3D12_DUMP_FRAME"); // a PPM of the first probed frame after 100 presents
+                if (dump && s->presents == 100) {
+                    FILE *f = fopen(dump, "wb");
+                    if (f) {
+                        fprintf(f, "P6\n%lu %lu\n255\n", (unsigned long)source.width, (unsigned long)source.height);
+                        for (size_t i = 0; i < n; i++) {
+                            uint8_t rgb[3] = {px[i * 4 + 2], px[i * 4 + 1], px[i * 4]};
+                            fwrite(rgb, 1, 3, f);
+                        }
+                        fclose(f);
+                    }
+                }
+                D3D_LOG("present %llu: %zu of %zu pixels non-black", (unsigned long long)s->presents, lit, n);
+                [probe release];
+            }
         }
     }
     s->index = (s->index + 1) % s->desc.BufferCount;
     s->presents++;
+    static long max_presents = -2; // D3D12_MAX_PRESENTS=n: exit after n frames, for bounded debug runs
+    if (max_presents == -2) max_presents = getenv("D3D12_MAX_PRESENTS") ? atol(getenv("D3D12_MAX_PRESENTS")) : -1;
+    if (max_presents >= 0 && (long)s->presents >= max_presents) exit(0);
     static WINAPI WINBOOL (*set_event)(HANDLE);
     if (!set_event) set_event = shim_lookup("SetEvent");
     if (s->latency_event) set_event(s->latency_event);

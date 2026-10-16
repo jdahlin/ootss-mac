@@ -23,6 +23,7 @@
 #include <directx/dxgiformat.h>
 #undef BOOL
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,5 +100,7 @@ typedef struct Device {
 } Device;
 
 id<MTLDevice> backend_mtl_device(void);
-MTLPixelFormat mtl_format(DXGI_FORMAT format);
+MTLPixelFormat mtl_format(DXGI_FORMAT format);                       // a typed format, as a view or attachment uses it
+MTLPixelFormat mtl_resource_format(const D3D12_RESOURCE_DESC *desc); // also resolves typeless formats
+MTLVertexFormat mtl_vertex_format(DXGI_FORMAT format);
 UINT format_bytes_per_block(DXGI_FORMAT format, UINT *block_size); // block_size: 1 or 4 (BC)

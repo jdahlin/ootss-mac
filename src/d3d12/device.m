@@ -62,30 +62,59 @@ static void dump_shader(const D3D12_SHADER_BYTECODE *code, const char *stage) {
     fclose(f);
 }
 
+// D3D12_LOG_PSO=1 prints one line per graphics pipeline describing the state it needs.
+static void log_graphics_pipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d) {
+    if (!getenv("D3D12_LOG_PSO")) return;
+    char layout[512] = "", targets[256] = "", blend[64] = "";
+    for (UINT i = 0; i < d->InputLayout.NumElements; i++) {
+        const D3D12_INPUT_ELEMENT_DESC *e = &d->InputLayout.pInputElementDescs[i];
+        snprintf(layout + strlen(layout), sizeof layout - strlen(layout), "%s%u:f%d@%u/s%u%s", i ? "," : "",
+                 e->SemanticIndex, e->Format, e->AlignedByteOffset, e->InputSlot,
+                 e->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA ? "i" : "");
+    }
+    for (UINT i = 0; i < d->NumRenderTargets; i++)
+        snprintf(targets + strlen(targets), sizeof targets - strlen(targets), "%s%d", i ? "," : "", d->RTVFormats[i]);
+    for (UINT i = 0; i < d->NumRenderTargets; i++) {
+        const D3D12_RENDER_TARGET_BLEND_DESC *b = &d->BlendState.RenderTarget[i];
+        if (b->BlendEnable)
+            snprintf(blend + strlen(blend), sizeof blend - strlen(blend), "[rt%u c%d/%d/%d a%d/%d/%d]", i, b->SrcBlend,
+                     b->DestBlend, b->BlendOp, b->SrcBlendAlpha, b->DestBlendAlpha, b->BlendOpAlpha);
+    }
+    D3D_LOG("PSO stages=%c%c%c%c%c topo=%d rt=%s dsv=%d samples=%u depth=%d/%d/%d stencil=%d cull=%d fill=%d "
+            "bias=%d clip=%d alpha2cov=%d indep=%d logic=%d strip=%d layout=%s blend=%s",
+            d->VS.pShaderBytecode ? 'V' : '-', d->PS.pShaderBytecode ? 'P' : '-', d->DS.pShaderBytecode ? 'D' : '-',
+            d->HS.pShaderBytecode ? 'H' : '-', d->GS.pShaderBytecode ? 'G' : '-', d->PrimitiveTopologyType, targets,
+            d->DSVFormat, d->SampleDesc.Count, d->DepthStencilState.DepthEnable, d->DepthStencilState.DepthWriteMask,
+            d->DepthStencilState.DepthFunc, d->DepthStencilState.StencilEnable, d->RasterizerState.CullMode,
+            d->RasterizerState.FillMode, d->RasterizerState.DepthBias, d->RasterizerState.DepthClipEnable,
+            d->BlendState.AlphaToCoverageEnable, d->BlendState.IndependentBlendEnable,
+            d->BlendState.RenderTarget[0].LogicOpEnable, d->IBStripCutValue, layout[0] ? layout : "-",
+            blend[0] ? blend : "-");
+}
+
 static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(Device *d,
                                                                     const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
                                                                     REFIID iid, void **out) {
+    log_graphics_pipeline(desc);
     dump_shader(&desc->VS, "vs");
     dump_shader(&desc->PS, "ps");
     dump_shader(&desc->DS, "ds");
     dump_shader(&desc->HS, "hs");
     dump_shader(&desc->GS, "gs");
-    const D3D12_SHADER_BYTECODE *stages[] = {&desc->VS, &desc->PS, &desc->DS, &desc->HS, &desc->GS};
-    return pipeline_state_create(d, false, stages, 5, iid, out);
+    return graphics_pipeline_create(d, desc, iid, out);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(Device *d,
                                                                    const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
                                                                    REFIID iid, void **out) {
     dump_shader(&desc->CS, "cs");
-    const D3D12_SHADER_BYTECODE *stages[] = {&desc->CS};
-    return pipeline_state_create(d, true, stages, 1, iid, out);
+    return compute_pipeline_create(d, desc, iid, out);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreatePipelineState(Device *d, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
                                                             REFIID iid, void **out) {
-    D3D_TODO("CreatePipelineState (stream form) creates an empty pipeline");
-    return pipeline_state_create(d, false, NULL, 0, iid, out);
+    D3D_TODO("CreatePipelineState (stream form) is not supported");
+    return E_NOTIMPL;
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(Device *d, const D3D12_COMMAND_SIGNATURE_DESC *desc,
@@ -110,58 +139,49 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(Device *d, ID3D12He
 
 // ---------------------------------------------------------------- descriptors
 static UINT STDMETHODCALLTYPE device_GetDescriptorHandleIncrementSize(Device *d, D3D12_DESCRIPTOR_HEAP_TYPE type) {
-    return DESCRIPTOR_SIZE;
-}
-
-static void write_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, DescriptorKind kind, ID3D12Resource *resource,
-                             const void *view, size_t view_size) {
-    Descriptor *d = descriptor_at(handle);
-    memset(d, 0, sizeof *d);
-    d->kind = kind;
-    d->resource = (Resource *)resource;
-    d->has_view_desc = view != NULL;
-    if (view) memcpy(&d->cbv, view, view_size); // the union's first member; all views share its storage
+    return DESCRIPTOR_STRIDE;
 }
 
 static void STDMETHODCALLTYPE device_CreateConstantBufferView(Device *d, const D3D12_CONSTANT_BUFFER_VIEW_DESC *view,
                                                               D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-    write_descriptor(handle, DESCRIPTOR_CBV, NULL, view, sizeof *view);
+    descriptor_create_cbv(d, view, handle);
 }
 
 static void STDMETHODCALLTYPE device_CreateShaderResourceView(Device *d, ID3D12Resource *resource,
                                                               const D3D12_SHADER_RESOURCE_VIEW_DESC *view,
                                                               D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-    write_descriptor(handle, DESCRIPTOR_SRV, resource, view, sizeof *view);
+    descriptor_create_srv(d, (Resource *)resource, view, handle);
 }
 
 static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(Device *d, ID3D12Resource *resource,
                                                                ID3D12Resource *counter,
                                                                const D3D12_UNORDERED_ACCESS_VIEW_DESC *view,
                                                                D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-    write_descriptor(handle, DESCRIPTOR_UAV, resource, view, sizeof *view);
+    if (counter) D3D_TODO("UAV counters are ignored");
+    descriptor_create_uav(d, (Resource *)resource, view, handle);
 }
 
 static void STDMETHODCALLTYPE device_CreateRenderTargetView(Device *d, ID3D12Resource *resource,
                                                             const D3D12_RENDER_TARGET_VIEW_DESC *view,
                                                             D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-    write_descriptor(handle, DESCRIPTOR_RTV, resource, view, sizeof *view);
+    descriptor_create_rtv(d, (Resource *)resource, view, handle);
 }
 
 static void STDMETHODCALLTYPE device_CreateDepthStencilView(Device *d, ID3D12Resource *resource,
                                                             const D3D12_DEPTH_STENCIL_VIEW_DESC *view,
                                                             D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-    write_descriptor(handle, DESCRIPTOR_DSV, resource, view, sizeof *view);
+    descriptor_create_dsv(d, (Resource *)resource, view, handle);
 }
 
 static void STDMETHODCALLTYPE device_CreateSampler(Device *d, const D3D12_SAMPLER_DESC *view,
                                                    D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-    write_descriptor(handle, DESCRIPTOR_SAMPLER, NULL, view, sizeof *view);
+    descriptor_create_sampler(d, view, handle);
 }
 
 static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(Device *d, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE dst,
                                                            D3D12_CPU_DESCRIPTOR_HANDLE src,
                                                            D3D12_DESCRIPTOR_HEAP_TYPE type) {
-    memmove((void *)dst.ptr, (const void *)src.ptr, (size_t)count * DESCRIPTOR_SIZE);
+    descriptors_copy(dst, src, count);
 }
 
 static void STDMETHODCALLTYPE device_CopyDescriptors(Device *d, UINT dst_range_count,
@@ -173,8 +193,9 @@ static void STDMETHODCALLTYPE device_CopyDescriptors(Device *d, UINT dst_range_c
     UINT di = 0, si = 0, d_off = 0, s_off = 0;
     while (di < dst_range_count && si < src_range_count) {
         UINT d_size = dst_sizes ? dst_sizes[di] : 1, s_size = src_sizes ? src_sizes[si] : 1;
-        memcpy((uint8_t *)dst_starts[di].ptr + (size_t)d_off * DESCRIPTOR_SIZE,
-               (const uint8_t *)src_starts[si].ptr + (size_t)s_off * DESCRIPTOR_SIZE, DESCRIPTOR_SIZE);
+        D3D12_CPU_DESCRIPTOR_HANDLE dst = {dst_starts[di].ptr + (size_t)d_off * DESCRIPTOR_STRIDE};
+        D3D12_CPU_DESCRIPTOR_HANDLE src = {src_starts[si].ptr + (size_t)s_off * DESCRIPTOR_STRIDE};
+        descriptors_copy(dst, src, 1);
         if (++d_off == d_size) di++, d_off = 0;
         if (++s_off == s_size) si++, s_off = 0;
     }
