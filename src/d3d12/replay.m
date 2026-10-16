@@ -134,6 +134,12 @@ static void probe_target(Replay *r, const View *v, unsigned pass) {
     }];
 }
 
+static bool fences_disabled(void) { // D3D12_NO_FENCE=1 (unsafe, for measuring what the fence chain costs)
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("D3D12_NO_FENCE") != NULL;
+    return disabled;
+}
+
 static void end_encoder(Replay *r) {
     View probed = r->colors[0];
     bool was_render = r->kind == ENCODER_RENDER;
@@ -167,7 +173,7 @@ static void end_encoder(Replay *r) {
 static id<MTLRenderCommandEncoder> open_render(Replay *r, MTLRenderPassDescriptor *pass) {
     end_encoder(r);
     id<MTLRenderCommandEncoder> e = [r->cb renderCommandEncoderWithDescriptor:pass];
-    if (r->queue->fence_used) [e waitForFence:r->queue->fence beforeStages:MTLRenderStageVertex];
+    if (r->queue->fence_used && !fences_disabled()) [e waitForFence:r->queue->fence beforeStages:MTLRenderStageVertex];
     g_stats.passes++;
     r->render = e;
     r->kind = ENCODER_RENDER;
@@ -179,7 +185,7 @@ static id<MTLComputeCommandEncoder> compute_encoder(Replay *r) {
     if (r->kind == ENCODER_COMPUTE) return r->compute;
     end_encoder(r);
     r->compute = [r->cb computeCommandEncoder];
-    if (r->queue->fence_used) [r->compute waitForFence:r->queue->fence];
+    if (r->queue->fence_used && !fences_disabled()) [r->compute waitForFence:r->queue->fence];
     r->kind = ENCODER_COMPUTE;
     r->compute_dirty = DIRTY_ALL;
     return r->compute;
@@ -189,7 +195,7 @@ static id<MTLBlitCommandEncoder> blit_encoder(Replay *r) {
     if (r->kind == ENCODER_BLIT) return r->blit;
     end_encoder(r);
     r->blit = [r->cb blitCommandEncoder];
-    if (r->queue->fence_used) [r->blit waitForFence:r->queue->fence];
+    if (r->queue->fence_used && !fences_disabled()) [r->blit waitForFence:r->queue->fence];
     r->kind = ENCODER_BLIT;
     return r->blit;
 }

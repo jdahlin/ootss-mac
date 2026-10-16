@@ -282,6 +282,7 @@ SHIM(HWND, CreateWindowExW, DWORD ex_style, const WCHAR *class_name, const WCHAR
         cocoa_pump();
         input_hide_cursor_until_game_decides();
     }
+    LOG("window id %ld (screencapture -l <id> saves it)", (long)w->ns.windowNumber);
     return w;
 }
 

@@ -74,6 +74,14 @@ static void commit(id<MTLCommandBuffer> cb) {
     residency_commit();
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
       dispatch_semaphore_signal(in_flight);
+      static _Atomic uint64_t gpu_ns, buffers; // D3D12_LOG_GPU=1: average GPU time per command buffer
+      if (getenv("D3D12_LOG_GPU")) {
+          atomic_fetch_add(&gpu_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
+          uint64_t n = atomic_fetch_add(&buffers, 1) + 1;
+          if (n % 120 == 0)
+              D3D_LOG("gpu: %.2f ms per command buffer over %llu buffers", atomic_exchange(&gpu_ns, 0) / 1e6 / 120,
+                      (unsigned long long)n);
+      }
       if (done.error) D3D_LOG("command buffer failed: %s", done.error.localizedDescription.UTF8String);
     }];
     [cb commit];

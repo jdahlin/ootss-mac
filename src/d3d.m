@@ -172,12 +172,12 @@ static const char *find_framework(const char *exe_dir) {
     return NULL;
 }
 
-// LOADER_D3D=native selects the D3D12-on-Metal backend in src/d3d12/ instead of D3DMetal.
+// Our own D3D12-on-Metal backend (src/d3d12/) is the default; LOADER_D3D=d3dmetal selects Apple's D3DMetal.
 void d3d12_backend_register(void);
 
 void d3d_backend_init(void) {
     const char *mode = getenv("LOADER_D3D");
-    if (mode && !strcmp(mode, "native")) {
+    if (!mode || strcmp(mode, "d3dmetal")) {
         d3d12_backend_register();
         LOG("d3d: native D3D12-on-Metal backend");
         return;

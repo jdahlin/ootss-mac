@@ -191,10 +191,17 @@ typedef struct SwapChain {
     UINT max_latency;
 } SwapChain;
 
+// The back buffer keeps the channel order the game renders in; CAMetalLayer takes RGBA8 as well as BGRA8.
+static MTLPixelFormat swapchain_pixel_format(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return MTLPixelFormatRGBA16Float;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return MTLPixelFormatRGBA8Unorm;
+    default: return MTLPixelFormatBGRA8Unorm;
+    }
+}
+
 static void swapchain_create_buffers(SwapChain *s) {
-    // BGRA8: CAMetalLayer cannot present RGBA8, and Metal cannot blit between the two.
-    MTLPixelFormat format =
-        s->desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+    MTLPixelFormat format = swapchain_pixel_format(s->desc.Format);
     MTLTextureDescriptor *t = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
                                                                                  width:s->desc.Width
                                                                                 height:s->desc.Height
@@ -214,8 +221,10 @@ static void swapchain_create_buffers(SwapChain *s) {
 
 static HRESULT STDMETHODCALLTYPE swapchain_Present(SwapChain *s, UINT sync_interval, UINT flags) {
     if (flags & DXGI_PRESENT_TEST) return S_OK;
+    static int benchmark = -1; // D3D12_NO_PRESENT=1: never show frames, so the game runs as fast as the GPU allows
+    if (benchmark < 0) benchmark = getenv("D3D12_NO_PRESENT") != NULL;
     @autoreleasepool {
-        id<CAMetalDrawable> drawable = [s->layer nextDrawable];
+        id<CAMetalDrawable> drawable = benchmark ? nil : [s->layer nextDrawable];
         if (drawable) {
             id<MTLCommandBuffer> cb = [s->queue->mtl commandBuffer];
             id<MTLTexture> source = s->buffers[s->index]->texture;
@@ -233,7 +242,7 @@ static HRESULT STDMETHODCALLTYPE swapchain_Present(SwapChain *s, UINT sync_inter
             // D3D12_LOG_PRESENT=1: report how much of the back buffer is non-black (BGRA8 only).
             id<MTLBuffer> probe = nil;
             if (getenv("D3D12_LOG_PRESENT") && s->presents % 20 == 0 &&
-                source.pixelFormat == MTLPixelFormatBGRA8Unorm) {
+                (source.pixelFormat == MTLPixelFormatBGRA8Unorm || source.pixelFormat == MTLPixelFormatRGBA8Unorm)) {
                 probe = [s->queue->object.device->mtl newBufferWithLength:source.width * source.height * 4
                                                                   options:MTLResourceStorageModeShared];
                 [blit copyFromTexture:source
@@ -260,7 +269,8 @@ static HRESULT STDMETHODCALLTYPE swapchain_Present(SwapChain *s, UINT sync_inter
                     if (f) {
                         fprintf(f, "P6\n%lu %lu\n255\n", (unsigned long)source.width, (unsigned long)source.height);
                         for (size_t i = 0; i < n; i++) {
-                            uint8_t rgb[3] = {px[i * 4 + 2], px[i * 4 + 1], px[i * 4]};
+                            bool bgra = source.pixelFormat == MTLPixelFormatBGRA8Unorm;
+                            uint8_t rgb[3] = {px[i * 4 + (bgra ? 2 : 0)], px[i * 4 + 1], px[i * 4 + (bgra ? 0 : 2)]};
                             fwrite(rgb, 1, 3, f);
                         }
                         fclose(f);
@@ -427,8 +437,7 @@ static HRESULT swapchain_create(Device *device, CommandQueue *queue, void *hwnd,
     NSView *view = (NSView *)cocoa_window_view(hwnd, &scale);
     s->layer = [[CAMetalLayer layer] retain];
     s->layer.device = device->mtl;
-    s->layer.pixelFormat =
-        s->desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+    s->layer.pixelFormat = swapchain_pixel_format(s->desc.Format);
     s->layer.framebufferOnly = NO; // the presented texture is a blit destination
     s->layer.contentsScale = scale;
     s->layer.displaySyncEnabled = getenv("D3D12_VSYNC") != NULL;
