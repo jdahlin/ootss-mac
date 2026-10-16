@@ -320,6 +320,17 @@ HRESULT command_signature_create(Device *device, const D3D12_COMMAND_SIGNATURE_D
     c->byte_stride = desc->ByteStride;
     c->argument_count = MIN(desc->NumArgumentDescs, 8u);
     memcpy(c->arguments, desc->pArgumentDescs, c->argument_count * sizeof *c->arguments);
+    char layout[256] = "";
+    for (UINT i = 0; i < c->argument_count; i++) {
+        const D3D12_INDIRECT_ARGUMENT_DESC *a = &c->arguments[i];
+        size_t n = strlen(layout);
+        snprintf(layout + n, sizeof layout - n, " %d", (int)a->Type);
+        if (a->Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT)
+            snprintf(layout + strlen(layout), sizeof layout - strlen(layout), "(root %u, +%u, %u values)",
+                     a->Constant.RootParameterIndex, a->Constant.DestOffsetIn32BitValues,
+                     a->Constant.Num32BitValuesToSet);
+    }
+    D3D_LOG("command signature: stride %u, arguments:%s", desc->ByteStride, layout);
     HRESULT hr = object_query(&c->object, iid, out);
     object_release(&c->object);
     return hr;

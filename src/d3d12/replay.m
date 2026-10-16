@@ -331,9 +331,7 @@ static MTLPrimitiveType primitive_type(D3D12_PRIMITIVE_TOPOLOGY t) {
 
 static bool ensure_render(Replay *r) {
     if (r->render && r->targets_open) return true;
-    if (!r->target_count && !r->has_depth) return false;
-    if (r->target_count && !r->colors[0].resource && !r->has_depth)
-        D3D_TODO("render target view %llx has no resource", (unsigned long long)r->colors[0].kind);
+    // No targets is legal (draws that only write UAVs); the pass then needs an explicit size.
 
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     PendingClear *used[MAX_RENDER_TARGETS + 1];
@@ -584,18 +582,39 @@ static void do_dispatch(Replay *r, const Command *c) {
         threadsPerThreadgroup:p->threads_per_group];
 }
 
-// Only signatures that are a plain draw are supported; others need per-draw root arguments, which Metal's
-// indirect draws cannot change.
+// Signatures that are a single plain draw or dispatch map straight onto Metal's indirect commands, whose
+// argument structures match D3D12's. Signatures that change root arguments per command are not supported.
 static void do_execute_indirect(Replay *r, const Command *c) {
     const CommandSignature *s = c->indirect.signature;
     if (!s || !c->indirect.arguments) return;
     D3D12_INDIRECT_ARGUMENT_TYPE action = s->arguments[s->argument_count - 1].Type;
-    if (s->argument_count != 1 ||
-        (action != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW && action != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)) {
+    bool dispatch = action == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    if (s->argument_count != 1 || (!dispatch && action != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW &&
+                                   action != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)) {
         D3D_TODO("ExecuteIndirect with %u arguments (last type %d) is skipped", s->argument_count, (int)action);
         return;
     }
-    if (c->indirect.count_buffer) D3D_TODO("ExecuteIndirect count buffer is ignored, max_count draws are issued");
+    if (c->indirect.count_buffer) D3D_TODO("ExecuteIndirect count buffer is ignored, max_count commands are issued");
+    g_stats.indirect++;
+
+    if (dispatch) {
+        PipelineState *p = r->compute_pipeline;
+        if (!p || !p->compute || !p->valid) return;
+        flush_clears(r);
+        id<MTLComputeCommandEncoder> e = compute_encoder(r);
+        unsigned dirty = r->compute_dirty;
+        r->compute_dirty = 0;
+        if (dirty & DIRTY_PIPELINE) [e setComputePipelineState:p->compute_state];
+        if (dirty & DIRTY_HEAPS) bind_heaps(r, nil, e);
+        uint32_t size = r->compute_root.signature ? r->compute_root.signature->argument_buffer_size : 0;
+        if ((dirty & DIRTY_ROOT) && size) [e setBytes:r->compute_root.arguments length:size atIndex:BIND_TOP_LEVEL];
+        for (UINT i = 0; i < c->indirect.max_count; i++)
+            [e dispatchThreadgroupsWithIndirectBuffer:c->indirect.arguments->buffer
+                                 indirectBufferOffset:c->indirect.arguments_offset + (uint64_t)i * s->byte_stride
+                                threadsPerThreadgroup:p->threads_per_group];
+        return;
+    }
+
     if (!prepare_draw(r)) return;
     MTLPrimitiveType primitive = primitive_type(r->topology);
     id<MTLBuffer> index_buffer = nil;
