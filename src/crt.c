@@ -1,15 +1,14 @@
-// UCRT (api-ms-win-crt-*) and VCRUNTIME140 shims.
+// Universal CRT (api-ms-win-crt-*) and VCRUNTIME140: startup, heap, strings, math, stdio, setjmp.
+#include "shim.h"
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include "shim.h"
 
-int win_vformat(char *out, size_t cap, const char *fmt, uint64_t *args, int wide_default);
-
-// ---- startup
+// ---------------------------------------------------------------- startup
 static int g_argc = 1;
 static char *g_argv_store[2] = {"sinking_star.exe", NULL};
 static char **g_argv = g_argv_store;
@@ -21,49 +20,74 @@ typedef WINAPI int (*PIFV)(void);
 SHIM(int *, __p___argc, void) { return &g_argc; }
 SHIM(char ***, __p___argv, void) { return &g_argv; }
 SHIM(int *, __p__commode, void) { return &g_commode; }
-SHIM(int, _set_fmode, int m) { g_fmode = m; return 0; }
-SHIM(void, _set_app_type, int t) { (void)t; }
-SHIM(int, _configure_narrow_argv, int m) { (void)m; return 0; }
-SHIM(int, _initialize_narrow_environment, void) { return 0; }
-SHIM(char **, _get_initial_narrow_environment, void) { return g_env_store; }
-SHIM(int, _configthreadlocale, int x) { (void)x; return 1; }
-SHIM(void, __setusermatherr, void *f) { (void)f; }
-SHIM(int, _set_new_mode, int m) { (void)m; return 0; }
-SHIM(int, _callnewh, size_t n) { (void)n; return 0; }
-SHIM(int, _initialize_onexit_table, void *t) { (void)t; return 0; }
-SHIM(int, _register_onexit_function, void *t, void *f) { (void)t; (void)f; return 0; }
-SHIM(int, _execute_onexit_table, void *t) { (void)t; return 0; }
-SHIM(int, _crt_atexit, void *f) { (void)f; return 0; }
-SHIM(int, _crt_at_quick_exit, void *f) { (void)f; return 0; }
-SHIM(void, _register_thread_local_exe_atexit_callback, void *f) { (void)f; }
-SHIM(int, _seh_filter_exe, DWORD code, void *ep) { (void)ep; LOG("_seh_filter_exe code=%#x", code); return 0; }
-SHIM(int, _seh_filter_dll, DWORD code, void *ep) { (void)ep; (void)code; return 0; }
-SHIM(void, _initterm, PVFV *b, PVFV *e) {
-    for (; b < e; b++) if (*b) (*b)();
-}
-SHIM(int, _initterm_e, PIFV *b, PIFV *e) {
-    for (; b < e; b++) if (*b) { int r = (*b)(); if (r) return r; }
+SHIM(int, _set_fmode, int m) {
+    g_fmode = m;
     return 0;
 }
-SHIM(void, exit, int c) { LOG("exit(%d)", c); exit(c); }
-SHIM(void, _exit, int c) { LOG("_exit(%d)", c); _exit(c); }
+SHIM(void, _set_app_type, int t) {}
+SHIM(int, _configure_narrow_argv, int m) { return 0; }
+SHIM(int, _initialize_narrow_environment, void) { return 0; }
+SHIM(char **, _get_initial_narrow_environment, void) { return g_env_store; }
+SHIM(int, _configthreadlocale, int x) { return 1; }
+SHIM(void, __setusermatherr, void *f) {}
+SHIM(int, _set_new_mode, int m) { return 0; }
+SHIM(int, _callnewh, size_t n) { return 0; }
+SHIM(int, _initialize_onexit_table, void *t) { return 0; }
+SHIM(int, _register_onexit_function, void *t, void *f) { return 0; }
+SHIM(int, _execute_onexit_table, void *t) { return 0; }
+SHIM(int, _crt_atexit, void *f) { return 0; }
+SHIM(int, _crt_at_quick_exit, void *f) { return 0; }
+SHIM(void, _register_thread_local_exe_atexit_callback, void *f) {}
+SHIM(int, _seh_filter_exe, DWORD code, void *ep) {
+    LOG("_seh_filter_exe code=%#x", code);
+    return 0;
+}
+SHIM(int, _seh_filter_dll, DWORD code, void *ep) { return 0; }
+SHIM(void, _initterm, PVFV *b, PVFV *e) {
+    for (; b < e; b++)
+        if (*b) (*b)();
+}
+SHIM(int, _initterm_e, PIFV *b, PIFV *e) {
+    for (; b < e; b++)
+        if (*b) {
+            int r = (*b)();
+            if (r) return r;
+        }
+    return 0;
+}
+SHIM(void, exit, int c) {
+    LOG("exit(%d)", c);
+    exit(c);
+}
+SHIM(void, _exit, int c) {
+    LOG("_exit(%d)", c);
+    _exit(c);
+}
 SHIM(void, _cexit, void) {}
 SHIM(void, _c_exit, void) {}
-SHIM(void, terminate, void) { LOG("terminate()"); abort(); }
+SHIM(void, terminate, void) {
+    LOG("terminate()");
+    abort();
+}
 SHIM(void, _wassert, const WCHAR *m, const WCHAR *f, unsigned l) {
-    LOG("assert: %s at %s:%u", w2u(m), w2u(f), l); abort();
+    LOG("assert: %s at %s:%u", w2u(m), w2u(f), l);
+    abort();
 }
 SHIM(char *, getenv, const char *n) { return getenv(n); }
 SHIM(long, strtol, const char *s, char **e, int b) { return (long)(int32_t)strtol(s, e, b); }
-SHIM(int64_t, _time64, int64_t *t) { int64_t v = time(NULL); if (t) *t = v; return v; }
+SHIM(int64_t, _time64, int64_t *t) {
+    int64_t v = time(NULL);
+    if (t) *t = v;
+    return v;
+}
 
-// ---- heap
+// ---------------------------------------------------------------- heap
 SHIM(void *, malloc, size_t n) { return malloc(n); }
 SHIM(void *, calloc, size_t a, size_t b) { return calloc(a, b); }
 SHIM(void *, realloc, void *p, size_t n) { return realloc(p, n); }
 SHIM(void, free, void *p) { free(p); }
 
-// ---- memory / strings
+// ---------------------------------------------------------------- memory and strings
 SHIM(void *, memcpy, void *d, const void *s, size_t n) { return memcpy(d, s, n); }
 SHIM(void *, memmove, void *d, const void *s, size_t n) { return memmove(d, s, n); }
 SHIM(void *, memset, void *d, int c, size_t n) { return memset(d, c, n); }
@@ -76,14 +100,17 @@ SHIM(char *, strncpy, char *d, const char *s, size_t n) { return strncpy(d, s, n
 SHIM(int, strncpy_s, char *d, size_t dn, const char *s, size_t n) {
     size_t l = strnlen(s, n);
     if (l >= dn) l = dn - 1;
-    memcpy(d, s, l); d[l] = 0; return 0;
+    memcpy(d, s, l);
+    d[l] = 0;
+    return 0;
 }
 SHIM(char *, strrchr, const char *s, int c) { return strrchr(s, c); }
 SHIM(char *, strstr, const char *a, const char *b) { return strstr(a, b); }
 
 static WCHAR *wstrstr(const WCHAR *h, const WCHAR *n) {
     size_t ln = wlen(n);
-    for (; *h; h++) if (!memcmp(h, n, ln * 2)) return (WCHAR *)h;
+    for (; *h; h++)
+        if (!memcmp(h, n, ln * 2)) return (WCHAR *)h;
     return ln ? NULL : (WCHAR *)h;
 }
 SHIM(WCHAR *, wcsstr, const WCHAR *h, const WCHAR *n) { return wstrstr(h, n); }
@@ -97,20 +124,26 @@ SHIM(int, wcsncpy_s, WCHAR *d, size_t dn, const WCHAR *s, size_t n) {
     size_t l = 0;
     while (l < n && s[l]) l++;
     if (l >= dn) l = dn - 1;
-    memcpy(d, s, l * 2); d[l] = 0; return 0;
+    memcpy(d, s, l * 2);
+    d[l] = 0;
+    return 0;
 }
 SHIM(int, wcsncat_s, WCHAR *d, size_t dn, const WCHAR *s, size_t n) {
     size_t dl = wlen(d), l = 0;
-    while (l < n && s[l] && dl + l + 1 < dn) { d[dl + l] = s[l]; l++; }
-    d[dl + l] = 0; return 0;
+    while (l < n && s[l] && dl + l + 1 < dn) {
+        d[dl + l] = s[l];
+        l++;
+    }
+    d[dl + l] = 0;
+    return 0;
 }
 
-// ---- qsort with an ms_abi comparator
+// ---------------------------------------------------------------- qsort with an ms_abi comparator
 typedef WINAPI int (*Cmp)(const void *, const void *);
 static int qsort_thunk(void *ctx, const void *a, const void *b) { return ((Cmp)ctx)(a, b); }
 SHIM(void, qsort, void *b, size_t n, size_t s, Cmp c) { qsort_r(b, n, s, (void *)c, qsort_thunk); }
 
-// ---- math
+// ---------------------------------------------------------------- math
 SHIM(float, sinf, float x) { return sinf(x); }
 SHIM(float, cosf, float x) { return cosf(x); }
 SHIM(float, tanf, float x) { return tanf(x); }
@@ -128,48 +161,72 @@ SHIM(double, log10, double x) { return log10(x); }
 SHIM(double, pow, double x, double y) { return pow(x, y); }
 SHIM(double, frexp, double x, int *e) { return frexp(x, e); }
 
-// ---- stdio
-#define OPT_STANDARD_SNPRINTF 2ull
+// ---------------------------------------------------------------- stdio
+// Without this option, a truncated vsnprintf returns -1 (legacy MSVC behaviour).
+#define _CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR 0x2ull
 SHIM(int, __stdio_common_vsprintf, uint64_t opt, char *buf, size_t n, const char *fmt, void *loc, uint64_t *va) {
-    (void)loc;
-    int len = win_vformat(buf, buf ? n : 0, fmt, va, 0);
-    if (buf && (size_t)len >= n && !(opt & OPT_STANDARD_SNPRINTF)) return -1;
+    int len = win_vformat(buf, buf ? n : 0, fmt, va, false);
+    if (buf && (size_t)len >= n && !(opt & _CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR)) return -1;
     return len;
 }
 SHIM(int, __stdio_common_vswprintf_s, uint64_t opt, WCHAR *buf, size_t n, const WCHAR *fmt, void *loc, uint64_t *va) {
-    (void)opt; (void)loc;
     char *f = w2u(fmt);
-    int len = win_vformat(NULL, 0, f, va, 1);
+    int len = win_vformat(NULL, 0, f, va, true);
     char *tmp = malloc(len + 1);
-    win_vformat(tmp, len + 1, f, va, 1);
+    win_vformat(tmp, len + 1, f, va, true);
     WCHAR *w = u2w(tmp);
     size_t wl = wlen(w);
     int r = (int)wl;
-    if (wl >= n) { if (n) buf[0] = 0; r = -1; }
-    else memcpy(buf, w, (wl + 1) * 2);
-    free(f); free(tmp); free(w);
+    if (wl >= n) {
+        if (n) buf[0] = 0;
+        r = -1;
+    } else
+        memcpy(buf, w, (wl + 1) * sizeof(WCHAR));
+    free(f);
+    free(tmp);
+    free(w);
     return r;
 }
 SHIM(int, _wfopen_s, FILE **out, const WCHAR *name, const WCHAR *mode) {
     char *n = w2u(name), *m = w2u(mode), *u = win_to_unix_path(n);
     *out = fopen(u, m);
+    int err = *out ? 0 : errno;
     TRACE("_wfopen_s(%s, %s) -> %p", u, m, (void *)*out);
-    free(n); free(m); free(u);
-    return *out ? 0 : 2;
+    free(n);
+    free(m);
+    free(u);
+    return err;
 }
 SHIM(size_t, fwrite, const void *p, size_t s, size_t n, FILE *f) { return fwrite(p, s, n, f); }
 SHIM(int, fclose, FILE *f) { return fclose(f); }
 
-// ---- vcruntime exception / setjmp support (not yet implemented)
-SHIM(void, _CxxThrowException, void *obj, void *info) { LOG("_CxxThrowException(%p, %p)", obj, info); abort(); }
-SHIM(void, _purecall, void) { LOG("_purecall"); abort(); }
-SHIM(void, __std_type_info_destroy_list, void *l) { (void)l; }
-SHIM(void, __std_exception_copy, const void *a, void *b) { memcpy(b, a, 16); }
-SHIM(void, __std_exception_destroy, void *a) { (void)a; }
+// ---------------------------------------------------------------- C++ exceptions (not supported: the game does not
+// throw)
+SHIM(void, _CxxThrowException, void *obj, void *info) {
+    LOG("_CxxThrowException(%p, %p)", obj, info);
+    abort();
+}
+SHIM(void, _purecall, void) {
+    LOG("_purecall");
+    abort();
+}
+SHIM(void, __std_type_info_destroy_list, void *l) {}
+SHIM(void, __std_exception_copy, const void *from, void *to) {
+    memcpy(to, from, 2 * sizeof(void *));
+} // {what, do_free}
+SHIM(void, __std_exception_destroy, void *a) {}
 
-// ---- setjmp/longjmp with the MSVC x64 _JUMP_BUFFER layout:
-// Frame 0, Rbx 8, Rsp 16, Rbp 24, Rsi 32, Rdi 40, R12-R15 48..72, Rip 80, MxCsr 88, FpCsr 92, Xmm6-15 96..240.
-// No SEH unwinding is done on longjmp (Frame is ignored).
+// ---------------------------------------------------------------- setjmp / longjmp
+// MSVC's x64 jump buffer. The assembly below uses these offsets; longjmp does no SEH unwinding.
+typedef struct {
+    uint64_t Frame, Rbx, Rsp, Rbp, Rsi, Rdi, R12, R13, R14, R15, Rip;
+    uint32_t MxCsr;
+    uint16_t FpCsr, Spare;
+    uint8_t Xmm6_15[10][16];
+} JUMP_BUFFER;
+_Static_assert(offsetof(JUMP_BUFFER, Rip) == 80 && offsetof(JUMP_BUFFER, MxCsr) == 88, "JUMP_BUFFER");
+_Static_assert(offsetof(JUMP_BUFFER, FpCsr) == 92 && offsetof(JUMP_BUFFER, Xmm6_15) == 96, "JUMP_BUFFER");
+
 __asm__(".intel_syntax noprefix\n"
         "_win_setjmp:\n"
         "  mov [rcx], rdx\n  mov [rcx+8], rbx\n  lea rax, [rsp+8]\n  mov [rcx+16], rax\n"
@@ -191,7 +248,7 @@ __asm__(".intel_syntax noprefix\n"
         "  mov rsp, [rcx+16]\n  jmp qword ptr [rcx+80]\n"
         ".att_syntax\n");
 extern char win_setjmp[], win_longjmp[];
-__attribute__((constructor)) static void setjmp_reg(void) {
+__attribute__((constructor)) static void setjmp_register(void) {
     shim_register("__intrinsic_setjmp", win_setjmp);
     shim_register("longjmp", win_longjmp);
 }

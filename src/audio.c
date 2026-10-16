@@ -1,495 +1,633 @@
-// MMDevice + WASAPI (shared mode, render only) on CoreAudio, enough for the game's statically linked Wwise.
+// MMDevice + WASAPI (shared-mode rendering) on CoreAudio, enough for the game's statically linked Wwise.
 //
-// Objects: IMMDeviceEnumerator -> IMMDevice (+IMMEndpoint, IPropertyStore) -> IAudioClient(3)
-//          -> IAudioRenderClient / IAudioClock / IAudioSessionControl / ISimpleAudioVolume.
-// The client exposes one 48 kHz float32 stereo endpoint (the default macOS output). Rendered frames go
-// through a single-producer/single-consumer ring to an AUHAL output unit, whose callback also signals
-// the client's event handle once per period (event-driven mode).
-// Unimplemented methods log "audio: unimplemented X::Y" and return E_NOTIMPL.
+//   IMMDeviceEnumerator -> IMMDevice (+ IPropertyStore, IMMEndpoint) -> IAudioClient3
+//                       -> IAudioRenderClient, IAudioClock, IAudioSessionControl2, ISimpleAudioVolume
+//
+// There is one endpoint: the default macOS output, presented as 48 kHz float32 stereo. Frames the game
+// renders go through a single-producer/single-consumer ring to an AUHAL output unit. Its render callback
+// also signals the client's event once per period, which drives Wwise's event-driven render loop.
+#include "shim.h"
 #include <AudioToolbox/AudioToolbox.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "shim.h"
 
-typedef uint32_t HRESULT;
-#define S_OK 0
-#define S_FALSE 1
-#define E_NOTIMPL 0x80004001u
-#define E_NOINTERFACE 0x80004002u
-#define E_POINTER 0x80004003u
-#define AUDCLNT_E_NOT_INITIALIZED 0x88890001u
-#define AUDCLNT_E_ALREADY_INITIALIZED 0x88890002u
-#define AUDCLNT_E_BUFFER_TOO_LARGE 0x88890006u
-#define AUDCLNT_E_UNSUPPORTED_FORMAT 0x88890008u
-#define AUDCLNT_S_BUFFER_EMPTY 0x08890001u
+#define SAMPLE_RATE   48000
+#define CHANNELS      2
+#define PERIOD_FRAMES 480        // 10 ms, the usual shared-mode engine period
+#define HNS_PER_SEC   10000000ll // REFERENCE_TIME is in 100 ns units
+#define PERIOD_HNS    (HNS_PER_SEC / 100)
 
-#define RATE 48000
-#define PERIOD_FRAMES 480                      // 10 ms, the usual shared-mode engine period
-#define PERIOD_HNS 100000ll                    // in 100 ns units
+// audioclient.h / mmdeviceapi.h
+#define AUDCLNT_SHAREMODE_SHARED          0
+#define AUDCLNT_STREAMFLAGS_EVENTCALLBACK 0x00040000
+#define AUDCLNT_BUFFERFLAGS_SILENT        0x2
+#define AUDCLNT_E_NOT_INITIALIZED         ((HRESULT)0x88890001)
+#define AUDCLNT_E_ALREADY_INITIALIZED     ((HRESULT)0x88890002)
+#define AUDCLNT_E_DEVICE_INVALIDATED      ((HRESULT)0x88890004)
+#define AUDCLNT_E_BUFFER_TOO_LARGE        ((HRESULT)0x88890006)
+#define AUDCLNT_E_UNSUPPORTED_FORMAT      ((HRESULT)0x88890008)
+#define DEVICE_STATE_ACTIVE               0x1
+#define AUDIO_SESSION_STATE_ACTIVE        1
+enum { eRender, eCapture, eAll };
 
 // ---------------------------------------------------------------- GUIDs
-typedef struct { uint8_t b[16]; } GUID;
-static GUID guid(const char *s) {  // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -> Windows memory layout
-    unsigned d1, d2, d3, b[8];
-    sscanf(s, "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]);
-    GUID g;
-    memcpy(g.b, &d1, 4);
-    memcpy(g.b + 4, &d2, 2);
-    memcpy(g.b + 6, &d3, 2);
-    for (int i = 0; i < 8; i++) g.b[8 + i] = (uint8_t)b[i];
-    return g;
-}
-static bool guid_eq(const void *a, const char *s) { GUID g = guid(s); return !memcmp(a, g.b, 16); }
+static const GUID CLSID_MMDeviceEnumerator = {
+    0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
+static const GUID IID_IUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const GUID IID_IMMDeviceEnumerator = {
+    0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}};
+static const GUID IID_IMMDevice = {0xd666063f, 0x1587, 0x4e43, {0x81, 0xf1, 0xb9, 0x48, 0xe8, 0x07, 0x36, 0x3f}};
+static const GUID IID_IMMEndpoint = {0x1be09788, 0x6894, 0x4089, {0x85, 0x86, 0x9a, 0x2a, 0x6c, 0x26, 0x5a, 0xc5}};
+static const GUID IID_IMMDeviceCollection = {
+    0x0bd7a1be, 0x7a1a, 0x44db, {0x83, 0x97, 0xcc, 0x53, 0x92, 0x38, 0x7b, 0x5e}};
+static const GUID IID_IPropertyStore = {0x886d8eeb, 0x8cf2, 0x4446, {0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99}};
+static const GUID IID_IAudioClient = {0x1cb9ad4c, 0xdbfa, 0x4c32, {0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2}};
+static const GUID IID_IAudioClient2 = {0x726778cd, 0xf60a, 0x4eda, {0x82, 0xde, 0xe4, 0x76, 0x10, 0xcd, 0x78, 0xaa}};
+static const GUID IID_IAudioClient3 = {0x7ed4ee07, 0x8e67, 0x4cd4, {0x8c, 0x1a, 0x2b, 0x7a, 0x59, 0x87, 0xad, 0x42}};
+static const GUID IID_IAudioRenderClient = {
+    0xf294acfc, 0x3146, 0x4483, {0xa7, 0xbf, 0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2}};
+static const GUID IID_IAudioClock = {0xcd63314f, 0x3fba, 0x4a1b, {0x81, 0x2c, 0xef, 0x96, 0x35, 0x87, 0x28, 0xe7}};
+static const GUID IID_IAudioSessionControl = {
+    0xf4b1a599, 0x7266, 0x4319, {0xa8, 0xca, 0xe7, 0x0a, 0xcb, 0x11, 0xe8, 0xcd}};
+static const GUID IID_IAudioSessionControl2 = {
+    0xbfb7ff88, 0x7239, 0x4fc9, {0x8f, 0xa2, 0x07, 0xc9, 0x50, 0xbe, 0x9c, 0x6d}};
+static const GUID IID_ISimpleAudioVolume = {
+    0x87ce5498, 0x68d6, 0x44e5, {0x92, 0x15, 0x6d, 0xa4, 0x7e, 0xf8, 0x83, 0xd8}};
+static const GUID KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = {
+    0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+static const PROPERTYKEY PKEY_Device_FriendlyName = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+static const PROPERTYKEY PKEY_AudioEngine_DeviceFormat = {
+    {0xf19f064d, 0x082c, 0x4e27, {0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c}}, 0};
 
-#define CLSID_MMDeviceEnumerator   "bcde0395-e52f-467c-8e3d-c4579291692e"
-#define IID_IUnknown               "00000000-0000-0000-c000-000000000046"
-#define IID_IMMDeviceEnumerator    "a95664d2-9614-4f35-a746-de8db63617e6"
-#define IID_IMMDevice              "d666063f-1587-4e43-81f1-b948e807363f"
-#define IID_IMMEndpoint            "1be09788-6894-4089-8586-9a2a6c265ac5"
-#define IID_IMMDeviceCollection    "0bd7a1be-7a1a-44db-8397-cc5392387b5e"
-#define IID_IPropertyStore         "886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"
-#define IID_IAudioClient           "1cb9ad4c-dbfa-4c32-b178-c2f568a703b2"
-#define IID_IAudioClient2          "726778cd-f60a-4eda-82de-e47610cd78aa"
-#define IID_IAudioClient3          "7ed4ee07-8e67-4cd4-8c1a-2b7a5987ad42"
-#define IID_IAudioRenderClient     "f294acfc-3146-4483-a7bf-addca7c260e2"
-#define IID_IAudioClock            "cd63314f-3fba-4a1b-812c-ef96358728e7"
-#define IID_IAudioSessionControl   "f4b1a599-7266-4319-a8ca-e70acb11e8cd"
-#define IID_IAudioSessionControl2  "bfb7ff88-7239-4fc9-8fa2-07c950be9c6d"
-#define IID_ISimpleAudioVolume     "87ce5498-68d6-44e5-9215-6da47ef883d8"
-#define IID_IAudioStreamVolume     "93014887-242d-4068-8a15-cf5e93b90fe3"
-#define KSDATAFORMAT_SUBTYPE_FLOAT "00000003-0000-0010-8000-00aa00389b71"
-#define KSDATAFORMAT_SUBTYPE_PCM   "00000001-0000-0010-8000-00aa00389b71"
-#define PKEY_Device_FriendlyName   "a45c254e-df1c-4efd-8020-67d146a850e0"   // pid 14
-#define PKEY_AudioEngine_DeviceFormat "f19f064d-082c-4e27-bc73-6882a1bb8e4c" // pid 0
+static bool guid_equal(const GUID *a, const GUID *b) { return !memcmp(a, b, sizeof *a); }
 
-// ---------------------------------------------------------------- tiny COM object model
-enum { A_ENUM, A_DEVICE, A_ENDPOINT, A_PROPS, A_COLLECTION, A_CLIENT, A_RENDER, A_CLOCK, A_SESSION, A_VOLUME, A_STREAMVOL, A_COUNT };
-static const char *const g_aiface[A_COUNT] = {"IMMDeviceEnumerator", "IMMDevice", "IMMEndpoint", "IPropertyStore",
-    "IMMDeviceCollection", "IAudioClient3", "IAudioRenderClient", "IAudioClock", "IAudioSessionControl2",
-    "ISimpleAudioVolume", "IAudioStreamVolume"};
-static const char *const m_unknown[] = {"QueryInterface", "AddRef", "Release"};
-static const char *const m_enum[] = {"EnumAudioEndpoints", "GetDefaultAudioEndpoint", "GetDevice",
-    "RegisterEndpointNotificationCallback", "UnregisterEndpointNotificationCallback", NULL};
-static const char *const m_device[] = {"Activate", "OpenPropertyStore", "GetId", "GetState", NULL};
-static const char *const m_endpoint[] = {"GetDataFlow", NULL};
-static const char *const m_props[] = {"GetCount", "GetAt", "GetValue", "SetValue", "Commit", NULL};
-static const char *const m_collection[] = {"GetCount", "Item", NULL};
-static const char *const m_client[] = {"Initialize", "GetBufferSize", "GetStreamLatency", "GetCurrentPadding",
-    "IsFormatSupported", "GetMixFormat", "GetDevicePeriod", "Start", "Stop", "Reset", "SetEventHandle", "GetService",
-    "IsOffloadCapable", "SetClientProperties", "GetBufferSizeLimits",                       // IAudioClient2
-    "GetSharedModeEnginePeriod", "GetCurrentSharedModeEnginePeriod", "InitializeSharedAudioStream", NULL};  // 3
-static const char *const m_render[] = {"GetBuffer", "ReleaseBuffer", NULL};
-static const char *const m_clock[] = {"GetFrequency", "GetPosition", "GetCharacteristics", NULL};
-static const char *const m_session[] = {"GetState", "GetDisplayName", "SetDisplayName", "GetIconPath", "SetIconPath",
-    "GetGroupingParam", "SetGroupingParam", "RegisterAudioSessionNotification", "UnregisterAudioSessionNotification",
-    "GetSessionIdentifier", "GetSessionInstanceIdentifier", "GetProcessId", "IsSystemSoundsSession", "SetDuckingPreference", NULL};
-static const char *const m_volume[] = {"SetMasterVolume", "GetMasterVolume", "SetMute", "GetMute", NULL};
-static const char *const m_streamvol[] = {"GetChannelCount", "SetChannelVolume", "GetChannelVolume", "SetAllVolumes", "GetAllVolumes", NULL};
-static const char *const *const g_amethods[A_COUNT] = {m_enum, m_device, m_endpoint, m_props, m_collection, m_client,
-    m_render, m_clock, m_session, m_volume, m_streamvol};
-
-typedef struct AObj {
+// ---------------------------------------------------------------- objects
+// Every object starts with its vtable. `iids` lists what QueryInterface answers with the same object.
+typedef struct Object {
     void **vtbl;
-    int kind;
+    const GUID *const *iids;
     volatile int refs;
-    struct AObj *client;  // for services: the owning client
-} AObj;
+    struct Client *client; // services (render client, clock, session, volume) belong to a client
+} Object;
 
-// ---------------------------------------------------------------- the one stream
-typedef struct {
-    AObj obj;
+static Object *object_new(void **vtbl, const GUID *const *iids, struct Client *client) {
+    Object *o = calloc(1, sizeof *o);
+    *o = (Object){vtbl, iids, 1, client};
+    return o;
+}
+
+static WINAPI HRESULT QueryInterface(Object *o, const GUID *iid, void **out) {
+    bool supported = guid_equal(iid, &IID_IUnknown);
+    for (const GUID *const *i = o->iids; *i && !supported; i++) supported = guid_equal(iid, *i);
+    if (!supported) {
+        LOG("audio: QueryInterface({%08x-...}) -> E_NOINTERFACE", iid->Data1);
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    __sync_add_and_fetch(&o->refs, 1);
+    *out = o;
+    return S_OK;
+}
+
+static WINAPI ULONG AddRef(Object *o) { return __sync_add_and_fetch(&o->refs, 1); }
+
+static WINAPI ULONG Release(Object *o) {
+    int refs = __sync_sub_and_fetch(&o->refs, 1);
+    return refs < 0 ? 0 : refs; // objects are tiny and never freed: Wwise keeps them for the whole run
+}
+
+// Methods the game never needs; they log once and fail.
+#define NOT_IMPLEMENTED(name)                                                                                          \
+    static WINAPI HRESULT name(void) {                                                                                 \
+        FIXME("audio: " #name " is not implemented");                                                                  \
+        return E_NOTIMPL;                                                                                              \
+    }
+
+#define IUNKNOWN_METHODS (void *)QueryInterface, (void *)AddRef, (void *)Release
+
+// ---------------------------------------------------------------- the stream
+typedef struct Client {
+    Object object;
     bool initialized, started, event_driven;
-    uint32_t channels, bits, is_float, block_align;
+    WORD channels, bits, block_align;
+    bool is_float;
     uint32_t buffer_frames;
-    float *ring;                       // stereo float frames
+    float *ring; // interleaved stereo float, ring_frames long
     uint32_t ring_frames;
-    _Atomic uint64_t written, played;  // frame counters
-    uint8_t *staging;                  // what GetBuffer hands out
-    uint32_t staged;
+    _Atomic uint64_t written, played; // frame counters
+    uint8_t *staging;                 // what GetBuffer hands out, in the client's format
     HANDLE event;
     AudioComponentInstance unit;
 } Client;
 
-static Client *g_client;
 static WINAPI WBOOL (*g_set_event)(HANDLE);
 
-static OSStatus render_cb(void *ctx, AudioUnitRenderActionFlags *fl, const AudioTimeStamp *ts, UInt32 bus, UInt32 n,
-                          AudioBufferList *io) {
-    (void)fl; (void)ts; (void)bus;
-    Client *c = ctx;
-    float *out = io->mBuffers[0].mData;  // interleaved stereo float
-    uint64_t w = atomic_load_explicit(&c->written, memory_order_acquire);
-    uint64_t p = atomic_load_explicit(&c->played, memory_order_relaxed);
-    uint32_t avail = (uint32_t)(w - p), take = avail < n ? avail : n;
+static uint32_t queued_frames(Client *c) { return (uint32_t)(atomic_load(&c->written) - atomic_load(&c->played)); }
+
+// CoreAudio render thread: drain the ring (silence on underrun), then wake the game's audio thread.
+static OSStatus render(void *context, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *time, UInt32 bus,
+                       UInt32 frames, AudioBufferList *io) {
+    Client *c = context;
+    float *out = io->mBuffers[0].mData;
+    uint64_t written = atomic_load_explicit(&c->written, memory_order_acquire);
+    uint64_t played = atomic_load_explicit(&c->played, memory_order_relaxed);
+    uint32_t available = (uint32_t)(written - played), take = available < frames ? available : frames;
     for (uint32_t i = 0; i < take; i++) {
-        uint32_t r = (uint32_t)((p + i) % c->ring_frames);
-        out[2 * i] = c->ring[2 * r];
-        out[2 * i + 1] = c->ring[2 * r + 1];
+        uint32_t slot = (uint32_t)((played + i) % c->ring_frames);
+        out[CHANNELS * i] = c->ring[CHANNELS * slot];
+        out[CHANNELS * i + 1] = c->ring[CHANNELS * slot + 1];
     }
-    memset(out + 2 * take, 0, (n - take) * 2 * sizeof(float));
-    atomic_store_explicit(&c->played, p + take, memory_order_release);
+    memset(out + CHANNELS * take, 0, (frames - take) * CHANNELS * sizeof(float));
+    atomic_store_explicit(&c->played, played + take, memory_order_release);
     if (c->event_driven && c->event) g_set_event(c->event);
     return noErr;
 }
 
-static bool start_unit(Client *c) {
-    AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0};
-    AudioComponent comp = AudioComponentFindNext(NULL, &d);
-    if (!comp || AudioComponentInstanceNew(comp, &c->unit)) return false;
-    AudioStreamBasicDescription f = {.mSampleRate = RATE, .mFormatID = kAudioFormatLinearPCM,
-        .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, .mBytesPerPacket = 8, .mFramesPerPacket = 1,
-        .mBytesPerFrame = 8, .mChannelsPerFrame = 2, .mBitsPerChannel = 32};
-    AudioUnitSetProperty(c->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f);
-    AURenderCallbackStruct cb = {render_cb, c};
-    AudioUnitSetProperty(c->unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
-    UInt32 frames = PERIOD_FRAMES;
-    AudioUnitSetProperty(c->unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &frames, sizeof frames);
+static bool open_output_unit(Client *c) {
+    AudioComponentDescription desc = {
+        .componentType = kAudioUnitType_Output,
+        .componentSubType = kAudioUnitSubType_DefaultOutput,
+        .componentManufacturer = kAudioUnitManufacturer_Apple,
+    };
+    AudioComponent component = AudioComponentFindNext(NULL, &desc);
+    if (!component || AudioComponentInstanceNew(component, &c->unit)) return false;
+
+    AudioStreamBasicDescription format = {
+        .mSampleRate = SAMPLE_RATE,
+        .mFormatID = kAudioFormatLinearPCM,
+        .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+        .mBytesPerPacket = CHANNELS * sizeof(float),
+        .mFramesPerPacket = 1,
+        .mBytesPerFrame = CHANNELS * sizeof(float),
+        .mChannelsPerFrame = CHANNELS,
+        .mBitsPerChannel = 32,
+    };
+    AURenderCallbackStruct callback = {render, c};
+    UInt32 period = PERIOD_FRAMES;
+    AudioUnitSetProperty(c->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &format, sizeof format);
+    AudioUnitSetProperty(c->unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &callback,
+                         sizeof callback);
+    AudioUnitSetProperty(c->unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &period,
+                         sizeof period);
     return AudioUnitInitialize(c->unit) == noErr;
 }
 
-// ---------------------------------------------------------------- unimplemented slots
-static const char *g_aname[256];
-static uint32_t g_naname;
-__attribute__((used)) static WINAPI HRESULT audio_unimpl(uint32_t id) {
-    LOG("audio: unimplemented %s", id < g_naname ? g_aname[id] : "?");
-    return E_NOTIMPL;
-}
-__asm__(".intel_syntax noprefix\n"
-        "_audio_unimpl_entry:\n"
-        "  mov ecx, r10d\n  jmp _audio_unimpl\n"
-        ".att_syntax\n");
-extern char audio_unimpl_entry[];
-
-// ---------------------------------------------------------------- methods
-static AObj *aobj_new(int kind, AObj *client);
-
-static WINAPI HRESULT a_QueryInterface(AObj *o, const void *iid, void **out) {
-    static const char *const fam[A_COUNT][4] = {
-        {IID_IMMDeviceEnumerator}, {IID_IMMDevice}, {IID_IMMEndpoint}, {IID_IPropertyStore}, {IID_IMMDeviceCollection},
-        {IID_IAudioClient, IID_IAudioClient2, IID_IAudioClient3}, {IID_IAudioRenderClient}, {IID_IAudioClock},
-        {IID_IAudioSessionControl, IID_IAudioSessionControl2}, {IID_ISimpleAudioVolume}, {IID_IAudioStreamVolume}};
-    bool ok = guid_eq(iid, IID_IUnknown);
-    for (int i = 0; i < 4 && fam[o->kind][i] && !ok; i++) ok = guid_eq(iid, fam[o->kind][i]);
-    if (ok) { __sync_add_and_fetch(&o->refs, 1); *out = o; return S_OK; }
-    if (o->kind == A_DEVICE && guid_eq(iid, IID_IMMEndpoint)) { *out = aobj_new(A_ENDPOINT, NULL); return S_OK; }
-    const uint32_t *g = iid;
-    LOG("audio: %s QueryInterface({%08x-...}) -> E_NOINTERFACE", g_aiface[o->kind], g[0]);
-    *out = NULL;
-    return E_NOINTERFACE;
-}
-static WINAPI uint32_t a_AddRef(AObj *o) { return __sync_add_and_fetch(&o->refs, 1); }
-static WINAPI uint32_t a_Release(AObj *o) { int r = __sync_sub_and_fetch(&o->refs, 1); return r < 0 ? 0 : r; }
-
-// IMMDeviceEnumerator
-static WINAPI HRESULT e_GetDefaultAudioEndpoint(AObj *o, int flow, int role, void **out) {
-    (void)o;
-    LOG("audio: GetDefaultAudioEndpoint(flow=%d, role=%d)", flow, role);
-    if (flow != 0) { *out = NULL; return 0x80070490; }  // E_NOTFOUND: no capture devices
-    *out = aobj_new(A_DEVICE, NULL);
-    return S_OK;
-}
-static WINAPI HRESULT e_GetDevice(AObj *o, const WCHAR *id, void **out) { (void)id; return e_GetDefaultAudioEndpoint(o, 0, 0, out); }
-static WINAPI HRESULT e_EnumAudioEndpoints(AObj *o, int flow, DWORD mask, void **out) {
-    (void)o; (void)mask;
-    AObj *c = aobj_new(A_COLLECTION, NULL);
-    c->client = (AObj *)(intptr_t)(flow == 0 || flow == 2);  // count of render devices
-    *out = c;
-    return S_OK;
-}
-static WINAPI HRESULT e_RegisterCallback(AObj *o, void *cb) { (void)o; (void)cb; return S_OK; }
-static WINAPI HRESULT col_GetCount(AObj *o, uint32_t *n) { *n = (uint32_t)(intptr_t)o->client; return S_OK; }
-static WINAPI HRESULT col_Item(AObj *o, uint32_t i, void **out) {
-    if (i >= (uint32_t)(intptr_t)o->client) return E_NOTIMPL;
-    *out = aobj_new(A_DEVICE, NULL);
-    return S_OK;
+static WAVEFORMATEXTENSIBLE *new_mix_format(void) {
+    WAVEFORMATEXTENSIBLE *f = malloc(sizeof *f); // freed by the caller with CoTaskMemFree
+    *f = (WAVEFORMATEXTENSIBLE){
+        .Format =
+            {
+                .wFormatTag = WAVE_FORMAT_EXTENSIBLE,
+                .nChannels = CHANNELS,
+                .nSamplesPerSec = SAMPLE_RATE,
+                .nAvgBytesPerSec = SAMPLE_RATE * CHANNELS * sizeof(float),
+                .nBlockAlign = CHANNELS * sizeof(float),
+                .wBitsPerSample = 32,
+                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX),
+            },
+        .wValidBitsPerSample = 32,
+        .dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT,
+        .SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+    };
+    return f;
 }
 
-// IMMDevice
-static WINAPI HRESULT d_Activate(AObj *o, const void *iid, DWORD ctx, void *params, void **out) {
-    (void)o; (void)ctx; (void)params;
-    if (guid_eq(iid, IID_IAudioClient) || guid_eq(iid, IID_IAudioClient2) || guid_eq(iid, IID_IAudioClient3)) {
-        Client *c = calloc(1, sizeof *c);
-        AObj *a = aobj_new(A_CLIENT, NULL);
-        c->obj = *a;
-        free(a);
-        *out = c;
-        LOG("audio: IMMDevice::Activate(IAudioClient) -> %p", (void *)c);
-        return S_OK;
-    }
-    if (guid_eq(iid, IID_IAudioStreamVolume) || guid_eq(iid, IID_ISimpleAudioVolume)) {
-        *out = aobj_new(guid_eq(iid, IID_ISimpleAudioVolume) ? A_VOLUME : A_STREAMVOL, NULL);
-        return S_OK;
-    }
-    const uint32_t *g = iid;
-    LOG("audio: IMMDevice::Activate({%08x-...}) -> E_NOINTERFACE", g[0]);
-    *out = NULL;
-    return E_NOINTERFACE;
-}
-static WINAPI HRESULT d_OpenPropertyStore(AObj *o, DWORD access, void **out) { (void)o; (void)access; *out = aobj_new(A_PROPS, NULL); return S_OK; }
-static WINAPI HRESULT d_GetId(AObj *o, WCHAR **out) { (void)o; *out = u2w("{0.0.0.00000000}.{coreaudio-default-output}"); return S_OK; }
-static WINAPI HRESULT d_GetState(AObj *o, DWORD *st) { (void)o; *st = 1; return S_OK; }  // DEVICE_STATE_ACTIVE
-static WINAPI HRESULT ep_GetDataFlow(AObj *o, int *f) { (void)o; *f = 0; return S_OK; }   // eRender
-
-static void fill_mix_format(uint8_t *w) {
-    memset(w, 0, 40);
-    *(uint16_t *)w = 0xFFFE;                  // WAVE_FORMAT_EXTENSIBLE
-    *(uint16_t *)(w + 2) = 2;
-    *(uint32_t *)(w + 4) = RATE;
-    *(uint32_t *)(w + 8) = RATE * 8;
-    *(uint16_t *)(w + 12) = 8;
-    *(uint16_t *)(w + 14) = 32;
-    *(uint16_t *)(w + 16) = 22;
-    *(uint16_t *)(w + 18) = 32;               // wValidBitsPerSample
-    *(uint32_t *)(w + 20) = 3;                // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
-    GUID g = guid(KSDATAFORMAT_SUBTYPE_FLOAT);
-    memcpy(w + 24, g.b, 16);
+static bool format_is_float(const WAVEFORMATEX *f) {
+    return f->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+           (f->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+            guid_equal(&((const WAVEFORMATEXTENSIBLE *)f)->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
 }
 
-// IPropertyStore: friendly name and device format.
-static WINAPI HRESULT p_GetCount(AObj *o, DWORD *n) { (void)o; *n = 2; return S_OK; }
-static WINAPI HRESULT p_GetValue(AObj *o, const uint8_t *key, uint8_t *pv) {
-    (void)o;
-    memset(pv, 0, 24);
-    uint32_t pid = *(const uint32_t *)(key + 16);
-    if (guid_eq(key, PKEY_Device_FriendlyName) && pid == 14) {
-        *(uint16_t *)pv = 31;                 // VT_LPWSTR
-        *(WCHAR **)(pv + 8) = u2w("Speakers (macOS default output)");
-    } else if (guid_eq(key, PKEY_AudioEngine_DeviceFormat) && pid == 0) {
-        *(uint16_t *)pv = 65;                 // VT_BLOB
-        uint8_t *w = malloc(40);
-        fill_mix_format(w);
-        *(uint32_t *)(pv + 8) = 40;
-        *(uint8_t **)(pv + 16) = w;
-    }
-    return S_OK;  // VT_EMPTY for anything else
+// We accept 48 kHz float32 or int16, any channel count (the first two channels are played).
+static bool format_supported(const WAVEFORMATEX *f) {
+    bool is_float = format_is_float(f);
+    return f->nSamplesPerSec == SAMPLE_RATE && f->nChannels &&
+           (is_float ? f->wBitsPerSample == 32 : f->wBitsPerSample == 16);
 }
 
-// IAudioClient
-static HRESULT client_init(Client *c, uint32_t flags, int64_t dur, const uint8_t *fmt) {
+// ---------------------------------------------------------------- IAudioClient3
+static HRESULT initialize(Client *c, DWORD flags, int64_t duration_hns, const WAVEFORMATEX *format) {
     if (c->initialized) return AUDCLNT_E_ALREADY_INITIALIZED;
-    uint16_t tag = *(uint16_t *)fmt;
-    c->channels = *(uint16_t *)(fmt + 2);
-    c->bits = *(uint16_t *)(fmt + 14);
-    c->block_align = *(uint16_t *)(fmt + 12);
-    uint32_t rate = *(uint32_t *)(fmt + 4);
-    c->is_float = tag == 3 || (tag == 0xFFFE && guid_eq(fmt + 24, KSDATAFORMAT_SUBTYPE_FLOAT));
-    LOG("audio: Initialize(flags=%#x, dur=%lldms, %u Hz, %u ch, %u bit %s)", flags, (long long)dur / 10000, rate, c->channels,
-        c->bits, c->is_float ? "float" : "int");
-    if (rate != RATE || !c->channels || !((c->is_float && c->bits == 32) || (!c->is_float && c->bits == 16)))
-        return AUDCLNT_E_UNSUPPORTED_FORMAT;
-    c->event_driven = flags & 0x40000;       // AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-    uint32_t frames = (uint32_t)(dur * RATE / 10000000);
-    if (frames < 2 * PERIOD_FRAMES) frames = 2 * PERIOD_FRAMES;
-    c->buffer_frames = frames;
-    c->ring_frames = frames * 2;
-    c->ring = calloc(c->ring_frames, 2 * sizeof(float));
-    c->staging = calloc(frames, c->block_align);
-    if (!start_unit(c)) { LOG("audio: CoreAudio output unit failed"); return 0x88890004; }  // DEVICE_INVALIDATED
+    LOG("audio: Initialize(%lld ms, %u Hz, %u ch, %u bit %s)", (long long)duration_hns / 10000, format->nSamplesPerSec,
+        format->nChannels, format->wBitsPerSample, format_is_float(format) ? "float" : "int");
+    if (!format_supported(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+
+    c->channels = format->nChannels;
+    c->bits = format->wBitsPerSample;
+    c->block_align = format->nBlockAlign;
+    c->is_float = format_is_float(format);
+    c->event_driven = flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    c->buffer_frames = (uint32_t)(duration_hns * SAMPLE_RATE / HNS_PER_SEC);
+    if (c->buffer_frames < 2 * PERIOD_FRAMES) c->buffer_frames = 2 * PERIOD_FRAMES;
+    c->ring_frames = c->buffer_frames * 2;
+    c->ring = calloc(c->ring_frames, CHANNELS * sizeof(float));
+    c->staging = calloc(c->buffer_frames, c->block_align);
+    if (!open_output_unit(c)) {
+        LOG("audio: could not open the CoreAudio output unit");
+        return AUDCLNT_E_DEVICE_INVALIDATED;
+    }
     c->initialized = true;
     return S_OK;
 }
-static WINAPI HRESULT c_Initialize(Client *c, int mode, DWORD flags, int64_t dur, int64_t period, const uint8_t *fmt, const void *sess) {
-    (void)period; (void)sess;
-    if (mode != 0) return AUDCLNT_E_UNSUPPORTED_FORMAT;  // exclusive mode not supported
-    return client_init(c, flags, dur, fmt);
+
+static WINAPI HRESULT Initialize(Client *c, int share_mode, DWORD flags, int64_t duration,
+                                                 int64_t period, const WAVEFORMATEX *format, const GUID *session) {
+    if (share_mode != AUDCLNT_SHAREMODE_SHARED) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    return initialize(c, flags, duration, format);
 }
-static WINAPI HRESULT c_InitializeSharedAudioStream(Client *c, DWORD flags, uint32_t period, const uint8_t *fmt, const void *sess) {
-    (void)sess;
-    return client_init(c, flags, (int64_t)period * 10000000 / RATE * 2, fmt);
+
+static WINAPI HRESULT InitializeSharedAudioStream(Client *c, DWORD flags, UINT period_frames,
+                                                                  const WAVEFORMATEX *format, const GUID *session) {
+    return initialize(c, flags, 2 * (int64_t)period_frames * HNS_PER_SEC / SAMPLE_RATE, format);
 }
-static WINAPI HRESULT c_GetBufferSize(Client *c, uint32_t *n) {
+
+static WINAPI HRESULT GetBufferSize(Client *c, UINT *frames) {
     if (!c->initialized) return AUDCLNT_E_NOT_INITIALIZED;
-    *n = c->buffer_frames;
+    *frames = c->buffer_frames;
     return S_OK;
 }
-static WINAPI HRESULT c_GetStreamLatency(Client *c, int64_t *l) { (void)c; *l = PERIOD_HNS; return S_OK; }
-static uint32_t padding(Client *c) { return (uint32_t)(atomic_load(&c->written) - atomic_load(&c->played)); }
-static WINAPI HRESULT c_GetCurrentPadding(Client *c, uint32_t *n) {
-    if (!c->initialized) return AUDCLNT_E_NOT_INITIALIZED;
-    *n = padding(c);
+
+static WINAPI HRESULT GetStreamLatency(Client *c, int64_t *latency) {
+    *latency = PERIOD_HNS;
     return S_OK;
 }
-static WINAPI HRESULT c_IsFormatSupported(Client *c, int mode, const uint8_t *fmt, uint8_t **closest) {
-    (void)c;
+
+static WINAPI HRESULT GetCurrentPadding(Client *c, UINT *frames) {
+    if (!c->initialized) return AUDCLNT_E_NOT_INITIALIZED;
+    *frames = queued_frames(c);
+    return S_OK;
+}
+
+static WINAPI HRESULT IsFormatSupported(Client *c, int share_mode, const WAVEFORMATEX *format,
+                                                        WAVEFORMATEXTENSIBLE **closest) {
     if (closest) *closest = NULL;
-    uint16_t tag = *(uint16_t *)fmt, bits = *(uint16_t *)(fmt + 14);
-    uint32_t rate = *(uint32_t *)(fmt + 4);
-    bool fl = tag == 3 || (tag == 0xFFFE && guid_eq(fmt + 24, KSDATAFORMAT_SUBTYPE_FLOAT));
-    bool ok = mode == 0 && rate == RATE && ((fl && bits == 32) || (!fl && bits == 16));
-    if (!ok && closest && mode == 0) {
-        *closest = malloc(40);
-        fill_mix_format(*closest);
+    if (share_mode == AUDCLNT_SHAREMODE_SHARED && format_supported(format)) return S_OK;
+    if (share_mode == AUDCLNT_SHAREMODE_SHARED && closest) {
+        *closest = new_mix_format();
         return S_FALSE;
     }
-    return ok ? S_OK : AUDCLNT_E_UNSUPPORTED_FORMAT;
+    return AUDCLNT_E_UNSUPPORTED_FORMAT;
 }
-static WINAPI HRESULT c_GetMixFormat(Client *c, uint8_t **out) { (void)c; *out = malloc(40); fill_mix_format(*out); return S_OK; }
-static WINAPI HRESULT c_GetDevicePeriod(Client *c, int64_t *def, int64_t *min) {
-    (void)c;
-    if (def) *def = PERIOD_HNS;
-    if (min) *min = PERIOD_HNS / 3;
+
+static WINAPI HRESULT GetMixFormat(Client *c, WAVEFORMATEXTENSIBLE **format) {
+    *format = new_mix_format();
     return S_OK;
 }
-static WINAPI HRESULT c_Start(Client *c) {
+
+static WINAPI HRESULT GetDevicePeriod(Client *c, int64_t *default_period, int64_t *minimum_period) {
+    if (default_period) *default_period = PERIOD_HNS;
+    if (minimum_period) *minimum_period = PERIOD_HNS / 3;
+    return S_OK;
+}
+
+static WINAPI HRESULT Start(Client *c) {
     if (!c->initialized) return AUDCLNT_E_NOT_INITIALIZED;
     if (!c->started) AudioOutputUnitStart(c->unit);
     c->started = true;
-    LOG("audio: Start");
     return S_OK;
 }
-static WINAPI HRESULT c_Stop(Client *c) {
+
+static WINAPI HRESULT Stop(Client *c) {
     if (c->started) AudioOutputUnitStop(c->unit);
     c->started = false;
     return S_OK;
 }
-static WINAPI HRESULT c_Reset(Client *c) { atomic_store(&c->played, atomic_load(&c->written)); return S_OK; }
-static WINAPI HRESULT c_SetEventHandle(Client *c, HANDLE e) { c->event = e; return S_OK; }
-static WINAPI HRESULT c_GetService(Client *c, const void *iid, void **out) {
-    int kind = guid_eq(iid, IID_IAudioRenderClient) ? A_RENDER : guid_eq(iid, IID_IAudioClock) ? A_CLOCK
-             : guid_eq(iid, IID_IAudioSessionControl) || guid_eq(iid, IID_IAudioSessionControl2) ? A_SESSION
-             : guid_eq(iid, IID_ISimpleAudioVolume) ? A_VOLUME : guid_eq(iid, IID_IAudioStreamVolume) ? A_STREAMVOL : -1;
-    if (kind < 0) {
-        const uint32_t *g = iid;
-        LOG("audio: GetService({%08x-...}) -> E_NOINTERFACE", g[0]);
-        *out = NULL;
-        return E_NOINTERFACE;
-    }
-    *out = aobj_new(kind, &c->obj);
-    if (kind == A_RENDER) g_client = c;
-    return S_OK;
-}
-static WINAPI HRESULT c_IsOffloadCapable(Client *c, int cat, WBOOL *b) { (void)c; (void)cat; *b = 0; return S_OK; }
-static WINAPI HRESULT c_SetClientProperties(Client *c, const void *p) { (void)c; (void)p; return S_OK; }
-static WINAPI HRESULT c_GetSharedModeEnginePeriod(Client *c, const void *f, uint32_t *def, uint32_t *fund, uint32_t *mn, uint32_t *mx) {
-    (void)c; (void)f;
-    *def = PERIOD_FRAMES; *fund = PERIOD_FRAMES; *mn = PERIOD_FRAMES; *mx = PERIOD_FRAMES;
-    return S_OK;
-}
-static WINAPI HRESULT c_GetCurrentSharedModeEnginePeriod(Client *c, uint8_t **f, uint32_t *p) {
-    (void)c;
-    *f = malloc(40);
-    fill_mix_format(*f);
-    *p = PERIOD_FRAMES;
+
+static WINAPI HRESULT Reset(Client *c) {
+    atomic_store(&c->played, atomic_load(&c->written));
     return S_OK;
 }
 
-// IAudioRenderClient
-static Client *client_of(AObj *o) { return (Client *)o->client; }
-static WINAPI HRESULT r_GetBuffer(AObj *o, uint32_t n, uint8_t **data) {
-    Client *c = client_of(o);
-    if (n > c->buffer_frames - padding(c)) return AUDCLNT_E_BUFFER_TOO_LARGE;
-    c->staged = n;
+static WINAPI HRESULT SetEventHandle(Client *c, HANDLE event) {
+    c->event = event;
+    return S_OK;
+}
+
+static WINAPI HRESULT IsOffloadCapable(Client *c, int category, WBOOL *capable) {
+    *capable = false;
+    return S_OK;
+}
+
+static WINAPI HRESULT SetClientProperties(Client *c, const void *properties) { return S_OK; }
+
+static WINAPI HRESULT GetSharedModeEnginePeriod(Client *c, const WAVEFORMATEX *format,
+                                                                UINT *default_period, UINT *fundamental_period,
+                                                                UINT *minimum_period, UINT *maximum_period) {
+    *default_period = *fundamental_period = *minimum_period = *maximum_period = PERIOD_FRAMES;
+    return S_OK;
+}
+
+static WINAPI HRESULT GetCurrentSharedModeEnginePeriod(Client *c, WAVEFORMATEXTENSIBLE **format,
+                                                                       UINT *period) {
+    *format = new_mix_format();
+    *period = PERIOD_FRAMES;
+    return S_OK;
+}
+
+NOT_IMPLEMENTED(GetBufferSizeLimits)
+static WINAPI HRESULT GetService(Client *c, const GUID *iid, void **out);
+
+static void *client_vtbl[] = {
+    IUNKNOWN_METHODS,
+    // IAudioClient
+    Initialize,
+    GetBufferSize,
+    GetStreamLatency,
+    GetCurrentPadding,
+    IsFormatSupported,
+    GetMixFormat,
+    GetDevicePeriod,
+    Start,
+    Stop,
+    Reset,
+    SetEventHandle,
+    GetService,
+    // IAudioClient2
+    IsOffloadCapable,
+    SetClientProperties,
+    GetBufferSizeLimits,
+    // IAudioClient3
+    GetSharedModeEnginePeriod,
+    GetCurrentSharedModeEnginePeriod,
+    InitializeSharedAudioStream,
+};
+static const GUID *const client_iids[] = {&IID_IAudioClient, &IID_IAudioClient2, &IID_IAudioClient3, NULL};
+
+// ---------------------------------------------------------------- IAudioRenderClient
+static WINAPI HRESULT GetBuffer(Object *o, UINT frames, uint8_t **data) {
+    Client *c = o->client;
+    if (frames > c->buffer_frames - queued_frames(c)) return AUDCLNT_E_BUFFER_TOO_LARGE;
     *data = c->staging;
     return S_OK;
 }
-static WINAPI HRESULT r_ReleaseBuffer(AObj *o, uint32_t n, DWORD flags) {
-    Client *c = client_of(o);
-    uint64_t w = atomic_load_explicit(&c->written, memory_order_relaxed);
-    for (uint32_t i = 0; i < n; i++) {
-        float l = 0, r = 0;
-        if (!(flags & 2)) {  // AUDCLNT_BUFFERFLAGS_SILENT
-            const uint8_t *f = c->staging + (size_t)i * c->block_align;
-            if (c->is_float) { l = ((const float *)f)[0]; r = c->channels > 1 ? ((const float *)f)[1] : l; }
-            else { l = ((const int16_t *)f)[0] / 32768.f; r = c->channels > 1 ? ((const int16_t *)f)[1] / 32768.f : l; }
+
+// Convert the staged frames to stereo float and append them to the ring.
+static WINAPI HRESULT ReleaseBuffer(Object *o, UINT frames, DWORD flags) {
+    Client *c = o->client;
+    uint64_t written = atomic_load_explicit(&c->written, memory_order_relaxed);
+    for (UINT i = 0; i < frames; i++) {
+        float left = 0, right = 0;
+        if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+            const uint8_t *frame = c->staging + (size_t)i * c->block_align;
+            if (c->is_float) {
+                const float *s = (const float *)frame;
+                left = s[0];
+                right = c->channels > 1 ? s[1] : left;
+            } else {
+                const int16_t *s = (const int16_t *)frame;
+                left = s[0] / 32768.f;
+                right = c->channels > 1 ? s[1] / 32768.f : left;
+            }
         }
-        uint32_t k = (uint32_t)((w + i) % c->ring_frames);
-        c->ring[2 * k] = l;
-        c->ring[2 * k + 1] = r;
+        uint32_t slot = (uint32_t)((written + i) % c->ring_frames);
+        c->ring[CHANNELS * slot] = left;
+        c->ring[CHANNELS * slot + 1] = right;
     }
-    atomic_store_explicit(&c->written, w + n, memory_order_release);
+    atomic_store_explicit(&c->written, written + frames, memory_order_release);
     return S_OK;
 }
 
-// IAudioClock: position in frames at RATE
-static WINAPI HRESULT k_GetFrequency(AObj *o, uint64_t *f) { (void)o; *f = RATE; return S_OK; }
-static WINAPI HRESULT k_GetPosition(AObj *o, uint64_t *pos, uint64_t *qpc) {
-    *pos = atomic_load(&client_of(o)->played);
-    if (qpc) *qpc = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 100;
+static void *render_client_vtbl[] = {IUNKNOWN_METHODS, GetBuffer, ReleaseBuffer};
+static const GUID *const render_client_iids[] = {&IID_IAudioRenderClient, NULL};
+
+// ---------------------------------------------------------------- IAudioClock: frames played at SAMPLE_RATE
+static WINAPI HRESULT GetFrequency(Object *o, uint64_t *frequency) {
+    *frequency = SAMPLE_RATE;
     return S_OK;
 }
-static WINAPI HRESULT k_GetCharacteristics(AObj *o, DWORD *c) { (void)o; *c = 0; return S_OK; }
 
-// Session / volume: inert
-static WINAPI HRESULT s_ok1(AObj *o, void *a) { (void)o; (void)a; return S_OK; }
-static WINAPI HRESULT s_GetState(AObj *o, int *st) { (void)o; *st = 1; return S_OK; }
-static WINAPI HRESULT v_GetMasterVolume(AObj *o, float *v) { (void)o; *v = 1; return S_OK; }
-static WINAPI HRESULT v_GetMute(AObj *o, WBOOL *m) { (void)o; *m = 0; return S_OK; }
-static WINAPI HRESULT sv_GetChannelCount(AObj *o, uint32_t *n) { (void)o; *n = 2; return S_OK; }
+static WINAPI HRESULT GetPosition(Object *o, uint64_t *position, uint64_t *qpc_position) {
+    *position = atomic_load(&o->client->played);
+    if (qpc_position) *qpc_position = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 100;
+    return S_OK;
+}
 
-// ---------------------------------------------------------------- vtable assembly
-typedef struct { int kind; const char *m; void *fn; } AImpl;
-#define AI(k, m, f) {k, m, (void *)f}
-static const AImpl g_aimpls[] = {
-    AI(-1, "QueryInterface", a_QueryInterface), AI(-1, "AddRef", a_AddRef), AI(-1, "Release", a_Release),
-    AI(A_ENUM, "GetDefaultAudioEndpoint", e_GetDefaultAudioEndpoint), AI(A_ENUM, "GetDevice", e_GetDevice),
-    AI(A_ENUM, "EnumAudioEndpoints", e_EnumAudioEndpoints),
-    AI(A_ENUM, "RegisterEndpointNotificationCallback", e_RegisterCallback),
-    AI(A_ENUM, "UnregisterEndpointNotificationCallback", e_RegisterCallback),
-    AI(A_COLLECTION, "GetCount", col_GetCount), AI(A_COLLECTION, "Item", col_Item),
-    AI(A_DEVICE, "Activate", d_Activate), AI(A_DEVICE, "OpenPropertyStore", d_OpenPropertyStore),
-    AI(A_DEVICE, "GetId", d_GetId), AI(A_DEVICE, "GetState", d_GetState), AI(A_ENDPOINT, "GetDataFlow", ep_GetDataFlow),
-    AI(A_PROPS, "GetCount", p_GetCount), AI(A_PROPS, "GetValue", p_GetValue),
-    AI(A_CLIENT, "Initialize", c_Initialize), AI(A_CLIENT, "GetBufferSize", c_GetBufferSize),
-    AI(A_CLIENT, "GetStreamLatency", c_GetStreamLatency), AI(A_CLIENT, "GetCurrentPadding", c_GetCurrentPadding),
-    AI(A_CLIENT, "IsFormatSupported", c_IsFormatSupported), AI(A_CLIENT, "GetMixFormat", c_GetMixFormat),
-    AI(A_CLIENT, "GetDevicePeriod", c_GetDevicePeriod), AI(A_CLIENT, "Start", c_Start), AI(A_CLIENT, "Stop", c_Stop),
-    AI(A_CLIENT, "Reset", c_Reset), AI(A_CLIENT, "SetEventHandle", c_SetEventHandle), AI(A_CLIENT, "GetService", c_GetService),
-    AI(A_CLIENT, "IsOffloadCapable", c_IsOffloadCapable), AI(A_CLIENT, "SetClientProperties", c_SetClientProperties),
-    AI(A_CLIENT, "GetSharedModeEnginePeriod", c_GetSharedModeEnginePeriod),
-    AI(A_CLIENT, "GetCurrentSharedModeEnginePeriod", c_GetCurrentSharedModeEnginePeriod),
-    AI(A_CLIENT, "InitializeSharedAudioStream", c_InitializeSharedAudioStream),
-    AI(A_RENDER, "GetBuffer", r_GetBuffer), AI(A_RENDER, "ReleaseBuffer", r_ReleaseBuffer),
-    AI(A_CLOCK, "GetFrequency", k_GetFrequency), AI(A_CLOCK, "GetPosition", k_GetPosition),
-    AI(A_CLOCK, "GetCharacteristics", k_GetCharacteristics),
-    AI(A_SESSION, "GetState", s_GetState), AI(A_SESSION, "RegisterAudioSessionNotification", s_ok1),
-    AI(A_SESSION, "UnregisterAudioSessionNotification", s_ok1),
-    AI(A_VOLUME, "GetMasterVolume", v_GetMasterVolume), AI(A_VOLUME, "GetMute", v_GetMute),
-    AI(A_STREAMVOL, "GetChannelCount", sv_GetChannelCount),
+static WINAPI HRESULT GetCharacteristics(Object *o, DWORD *characteristics) {
+    *characteristics = 0;
+    return S_OK;
+}
+
+static void *clock_vtbl[] = {IUNKNOWN_METHODS, GetFrequency, GetPosition, GetCharacteristics};
+static const GUID *const clock_iids[] = {&IID_IAudioClock, NULL};
+
+// ---------------------------------------------------------------- IAudioSessionControl2, ISimpleAudioVolume
+static WINAPI HRESULT GetState(Object *o, int *state) {
+    *state = AUDIO_SESSION_STATE_ACTIVE;
+    return S_OK;
+}
+
+static WINAPI HRESULT RegisterAudioSessionNotification(Object *o, void *client) { return S_OK; }
+
+NOT_IMPLEMENTED(GetDisplayName)
+NOT_IMPLEMENTED(SetDisplayName)
+NOT_IMPLEMENTED(GetIconPath)
+NOT_IMPLEMENTED(SetIconPath)
+NOT_IMPLEMENTED(GetGroupingParam)
+NOT_IMPLEMENTED(SetGroupingParam)
+NOT_IMPLEMENTED(GetSessionIdentifier)
+NOT_IMPLEMENTED(GetSessionInstanceIdentifier)
+NOT_IMPLEMENTED(GetProcessId)
+NOT_IMPLEMENTED(IsSystemSoundsSession)
+NOT_IMPLEMENTED(SetDuckingPreference)
+
+static void *session_vtbl[] = {
+    IUNKNOWN_METHODS,
+    // IAudioSessionControl
+    GetState,
+    GetDisplayName,
+    SetDisplayName,
+    GetIconPath,
+    SetIconPath,
+    GetGroupingParam,
+    SetGroupingParam,
+    RegisterAudioSessionNotification,
+    RegisterAudioSessionNotification /* Unregister */,
+    // IAudioSessionControl2
+    GetSessionIdentifier,
+    GetSessionInstanceIdentifier,
+    GetProcessId,
+    IsSystemSoundsSession,
+    SetDuckingPreference,
 };
+static const GUID *const session_iids[] = {&IID_IAudioSessionControl, &IID_IAudioSessionControl2, NULL};
 
-static void **g_avt[A_COUNT];
-static void **build_avtable(int kind) {
-    int n = 3;
-    while (g_amethods[kind][n - 3]) n++;
-    void **vt = calloc(n, sizeof *vt);
-    for (int i = 0; i < n; i++) {
-        const char *m = i < 3 ? m_unknown[i] : g_amethods[kind][i - 3];
-        void *fn = NULL;
-        for (size_t j = 0; j < sizeof g_aimpls / sizeof *g_aimpls && !fn; j++)
-            if ((g_aimpls[j].kind == kind || g_aimpls[j].kind == -1) && !strcmp(g_aimpls[j].m, m)) fn = g_aimpls[j].fn;
-        if (!fn) {
-            char name[96];
-            snprintf(name, sizeof name, "%s::%s", g_aiface[kind], m);
-            g_aname[g_naname] = strdup(name);
-            fn = make_tagged_thunk(g_naname++, audio_unimpl_entry);
-        }
-        vt[i] = fn;
+static WINAPI HRESULT GetMasterVolume(Object *o, float *level) {
+    *level = 1;
+    return S_OK;
+}
+
+static WINAPI HRESULT GetMute(Object *o, WBOOL *muted) {
+    *muted = false;
+    return S_OK;
+}
+
+NOT_IMPLEMENTED(SetMasterVolume)
+NOT_IMPLEMENTED(SetMute)
+
+static void *volume_vtbl[] = {IUNKNOWN_METHODS, SetMasterVolume, GetMasterVolume, SetMute, GetMute};
+static const GUID *const volume_iids[] = {&IID_ISimpleAudioVolume, NULL};
+
+static WINAPI HRESULT GetService(Client *c, const GUID *iid, void **out) {
+    void **vtbl = guid_equal(iid, &IID_IAudioRenderClient) ? render_client_vtbl
+                  : guid_equal(iid, &IID_IAudioClock)      ? clock_vtbl
+                  : guid_equal(iid, &IID_IAudioSessionControl) || guid_equal(iid, &IID_IAudioSessionControl2)
+                      ? session_vtbl
+                  : guid_equal(iid, &IID_ISimpleAudioVolume) ? volume_vtbl
+                                                             : NULL;
+    const GUID *const *iids = vtbl == render_client_vtbl ? render_client_iids
+                              : vtbl == clock_vtbl       ? clock_iids
+                              : vtbl == session_vtbl     ? session_iids
+                                                         : volume_iids;
+    if (!vtbl) {
+        LOG("audio: GetService({%08x-...}) -> E_NOINTERFACE", iid->Data1);
+        *out = NULL;
+        return E_NOINTERFACE;
     }
-    return vt;
+    *out = object_new(vtbl, iids, c);
+    return S_OK;
 }
 
-static pthread_mutex_t g_alock = PTHREAD_MUTEX_INITIALIZER;
-static AObj *aobj_new(int kind, AObj *client) {
-    pthread_mutex_lock(&g_alock);
-    if (!g_avt[kind]) g_avt[kind] = build_avtable(kind);
-    pthread_mutex_unlock(&g_alock);
-    AObj *o = calloc(1, sizeof *o);
-    o->vtbl = g_avt[kind];
-    o->kind = kind;
-    o->refs = 1;
-    o->client = client;
-    return o;
+// ---------------------------------------------------------------- IMMDevice, IPropertyStore, IMMEndpoint
+static WINAPI HRESULT GetCount(Object *o, DWORD *count) {
+    *count = 2;
+    return S_OK;
 }
+
+static WINAPI HRESULT GetValue(Object *o, const PROPERTYKEY *key, PROPVARIANT *value) {
+    memset(value, 0, sizeof *value); // VT_EMPTY unless known
+    if (guid_equal(&key->fmtid, &PKEY_Device_FriendlyName.fmtid) && key->pid == PKEY_Device_FriendlyName.pid) {
+        value->vt = VT_LPWSTR;
+        value->pwszVal = u2w("Speakers (macOS default output)");
+    } else if (guid_equal(&key->fmtid, &PKEY_AudioEngine_DeviceFormat.fmtid) &&
+               key->pid == PKEY_AudioEngine_DeviceFormat.pid) {
+        value->vt = VT_BLOB;
+        value->blob.cbSize = sizeof(WAVEFORMATEXTENSIBLE);
+        value->blob.pBlobData = (BYTE *)new_mix_format();
+    }
+    return S_OK;
+}
+
+NOT_IMPLEMENTED(GetAt)
+NOT_IMPLEMENTED(SetValue)
+NOT_IMPLEMENTED(Commit)
+
+static void *property_store_vtbl[] = {IUNKNOWN_METHODS, GetCount, GetAt, GetValue, SetValue, Commit};
+static const GUID *const property_store_iids[] = {&IID_IPropertyStore, NULL};
+
+static WINAPI HRESULT GetDataFlow(Object *o, int *flow) {
+    *flow = eRender;
+    return S_OK;
+}
+
+static void *endpoint_vtbl[] = {IUNKNOWN_METHODS, GetDataFlow};
+static const GUID *const endpoint_iids[] = {&IID_IMMEndpoint, NULL};
+
+static WINAPI HRESULT Activate(Object *o, const GUID *iid, DWORD context, void *params, void **out) {
+    if (guid_equal(iid, &IID_IAudioClient) || guid_equal(iid, &IID_IAudioClient2) ||
+        guid_equal(iid, &IID_IAudioClient3)) {
+        Client *c = calloc(1, sizeof *c);
+        c->object = (Object){client_vtbl, client_iids, 1, c};
+        *out = c;
+        return S_OK;
+    }
+    if (guid_equal(iid, &IID_ISimpleAudioVolume)) {
+        *out = object_new(volume_vtbl, volume_iids, NULL);
+        return S_OK;
+    }
+    LOG("audio: IMMDevice::Activate({%08x-...}) -> E_NOINTERFACE", iid->Data1);
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static WINAPI HRESULT OpenPropertyStore(Object *o, DWORD access, void **out) {
+    *out = object_new(property_store_vtbl, property_store_iids, NULL);
+    return S_OK;
+}
+
+static WINAPI HRESULT GetId(Object *o, WCHAR **id) {
+    *id = u2w("{0.0.0.00000000}.{coreaudio-default-output}");
+    return S_OK;
+}
+
+static WINAPI HRESULT GetDeviceState(Object *o, DWORD *state) {
+    *state = DEVICE_STATE_ACTIVE;
+    return S_OK;
+}
+
+static void *device_vtbl[] = {IUNKNOWN_METHODS, Activate, OpenPropertyStore, GetId, GetDeviceState};
+static const GUID *const device_iids[] = {&IID_IMMDevice, NULL};
+
+// IMMDevice also answers IMMEndpoint with a separate object.
+static WINAPI HRESULT DeviceQueryInterface(Object *o, const GUID *iid, void **out) {
+    if (guid_equal(iid, &IID_IMMEndpoint)) {
+        *out = object_new(endpoint_vtbl, endpoint_iids, NULL);
+        return S_OK;
+    }
+    return QueryInterface(o, iid, out);
+}
+
+// ---------------------------------------------------------------- IMMDeviceEnumerator, IMMDeviceCollection
+static Object *new_device(void) {
+    Object *device = object_new(device_vtbl, device_iids, NULL);
+    return device;
+}
+
+static WINAPI HRESULT GetDefaultAudioEndpoint(Object *o, int flow, int role, void **out) {
+    if (flow != eRender) { // no capture devices
+        *out = NULL;
+        return E_NOTFOUND;
+    }
+    *out = new_device();
+    return S_OK;
+}
+
+static WINAPI HRESULT GetDevice(Object *o, const WCHAR *id, void **out) {
+    return GetDefaultAudioEndpoint(o, eRender, 0, out);
+}
+
+static WINAPI HRESULT CollectionGetCount(Object *o, UINT *count) {
+    *count = (UINT)(uintptr_t)o->client; // number of render devices, see EnumAudioEndpoints
+    return S_OK;
+}
+
+static WINAPI HRESULT Item(Object *o, UINT index, void **out) {
+    if (index >= (UINT)(uintptr_t)o->client) return E_NOTFOUND;
+    *out = new_device();
+    return S_OK;
+}
+
+static void *collection_vtbl[] = {IUNKNOWN_METHODS, CollectionGetCount, Item};
+static const GUID *const collection_iids[] = {&IID_IMMDeviceCollection, NULL};
+
+static WINAPI HRESULT EnumAudioEndpoints(Object *o, int flow, DWORD state_mask, void **out) {
+    bool render = flow == eRender || flow == eAll;
+    *out = object_new(collection_vtbl, collection_iids, (Client *)(uintptr_t)render);
+    return S_OK;
+}
+
+static WINAPI HRESULT RegisterEndpointNotificationCallback(Object *o, void *client) { return S_OK; }
+
+static void *enumerator_vtbl[] = {
+    IUNKNOWN_METHODS,
+    EnumAudioEndpoints,
+    GetDefaultAudioEndpoint,
+    GetDevice,
+    RegisterEndpointNotificationCallback,
+    RegisterEndpointNotificationCallback /* Unregister */,
+};
+static const GUID *const enumerator_iids[] = {&IID_IMMDeviceEnumerator, NULL};
 
 // Called by the CoCreateInstance shim.
-HRESULT audio_create_instance(const void *clsid, const void *iid, void **out) {
-    if (!guid_eq(clsid, CLSID_MMDeviceEnumerator)) return 0x80040154;  // REGDB_E_CLASSNOTREG
+HRESULT audio_create_instance(const GUID *clsid, const GUID *iid, void **out) {
+    if (!guid_equal(clsid, &CLSID_MMDeviceEnumerator)) return REGDB_E_CLASSNOTREG;
     if (!g_set_event) g_set_event = shim_lookup("SetEvent");
-    AObj *e = aobj_new(A_ENUM, NULL);
-    HRESULT r = a_QueryInterface(e, iid, out);
-    LOG("audio: CoCreateInstance(MMDeviceEnumerator) -> %#x", r);
+    device_vtbl[0] = (void *)DeviceQueryInterface;
+    Object *enumerator = object_new(enumerator_vtbl, enumerator_iids, NULL);
+    HRESULT r = QueryInterface(enumerator, iid, out);
+    Release(enumerator); // the caller now holds the only reference
+    if (r != S_OK) free(enumerator);
     return r;
 }

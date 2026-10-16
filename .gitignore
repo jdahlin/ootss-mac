@@ -1,3 +1,4 @@
 build/
 deps/
 D3DMetal.framework
+compile_commands.json

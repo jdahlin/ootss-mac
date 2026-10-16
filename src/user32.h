@@ -1,0 +1,18 @@
+// Internals shared by the user32 shims (window.m, input.m).
+#pragma once
+#include "shim.h"
+#import <Cocoa/Cocoa.h>
+
+// An HWND is a pointer to one of these.
+typedef struct Window {
+    NSWindow *ns;
+    WNDPROC proc;
+    intptr_t longs[32]; // SetWindowLong values, indexed by -index for the negative GWL_* indices
+} Window;
+
+extern Window *g_window; // the game's only window
+
+void post_message(Window *w, UINT message, WPARAM wparam, LPARAM lparam);
+bool handle_input_event(NSEvent *event); // true if consumed as game input
+
+NSSize client_size_in_pixels(Window *w);

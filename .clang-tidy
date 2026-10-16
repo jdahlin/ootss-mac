@@ -1,0 +1,22 @@
+# Bug-finding checks only; style is clang-format's job.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  misc-redundant-expression,
+  readability-inconsistent-declaration-parameter-name,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-assignment-in-if-condition,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -performance-no-int-to-ptr,
+  -clang-analyzer-security.MmapWriteExec,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -clang-analyzer-optin.taint.GenericTaint
+# Disabled on purpose: Windows HANDLEs are integers and pointers by design (no-int-to-ptr), the loader
+# must map executable game code (MmapWriteExec), and COM out-parameters are void ** (multi-level).
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/.*'

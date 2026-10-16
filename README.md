@@ -68,10 +68,21 @@ saves), the clipboard. Steam is stubbed as "running, offline".
 | File | Contents |
 | --- | --- |
 | `src/loader.c` | PE loader, import binding, TEB/TLS through `%gs`, crash reports, `main` |
-| `src/kernel32.c` | Threads, sync objects, files, memory, time |
+| `src/win32.h` | The Windows types, structures and constants we use, size-checked against x64 Windows |
+| `src/shim.h` | Shim registration (`SHIM(...)`), logging and shared declarations |
+| `src/sync.c` | Threads, events, semaphores, waits, critical sections |
+| `src/files.c` | Files, directory search, file mappings, console output |
+| `src/kernel32.c` | Virtual memory, heaps, time, system information, modules |
 | `src/crt.c` | Universal CRT and VCRUNTIME, including Windows `printf` and `setjmp` |
-| `src/user32.m` | Window, message queue, keyboard/mouse/raw input on Cocoa |
+| `src/window.m` | Window, message queue and display metrics on Cocoa |
+| `src/input.m` | Keyboard, mouse and Raw Input |
 | `src/audio.c` | MMDevice/WASAPI on CoreAudio (for the game's Wwise) |
 | `src/d3d.m` | D3D12/DXGI through D3DMetal |
-| `src/misc.c` | Registry, COM, shell, Steam stubs |
-| `src/strings.c` | UTF-16, path and format helpers |
+| `src/misc.c` | Registry, COM, shell, dbghelp |
+| `src/steam.c` | Steam, reported as running but offline |
+| `src/strings.c` | UTF-16, path and printf helpers |
+
+## Development
+
+`make format` runs clang-format and `make lint` runs clang-tidy (`brew install llvm`).
+`LOADER_TRACE=1` logs Win32 calls, and shims that are knowingly partial log their first calls as `[fixme]`.
