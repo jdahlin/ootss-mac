@@ -46,6 +46,16 @@ app: all
 	cp build/sinking-star build/libmetalirconverter.dylib "$(APP)/Contents/MacOS/"
 	@test ! -e build/libd3dmetal-native.dylib || cp build/libd3dmetal-native.dylib "$(APP)/Contents/MacOS/"
 	@test ! -e build/D3DMetal.framework || ln -sfn "$(CURDIR)/build/D3DMetal.framework" "$(APP)/Contents/MacOS/D3DMetal.framework"
+	@# With GAME set, the icon is read from the game's own executable (never stored in the repository).
+	@if [ -f "$(GAME)/sinking_star.exe" ]; then \
+	  mkdir -p "$(APP)/Contents/Resources" build/AppIcon.iconset && \
+	  build/sinking-star --extract-icon build/AppIcon.png "$(GAME)/sinking_star.exe" >/dev/null 2>&1 && \
+	  for s in 16 32 64 128 256; do sips -z $$s $$s build/AppIcon.png --out build/AppIcon.iconset/$$s.png >/dev/null; done && \
+	  cd build/AppIcon.iconset && mv 16.png icon_16x16.png && cp 32.png icon_16x16@2x.png && mv 32.png icon_32x32.png && \
+	  cp 64.png icon_32x32@2x.png && rm 64.png && mv 128.png icon_128x128.png && cp 256.png icon_128x128@2x.png && \
+	  mv 256.png icon_256x256.png && cd ../.. && \
+	  iconutil -c icns build/AppIcon.iconset -o "$(APP)/Contents/Resources/AppIcon.icns" && echo "icon: extracted from the game"; \
+	fi
 	codesign --force --deep -s - "$(APP)"
 
 build/obj/d3d12/%.c.o: src/d3d12/%.c $(HDRS)

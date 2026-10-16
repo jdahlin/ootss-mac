@@ -103,6 +103,8 @@ void cocoa_init(void);
 void cocoa_pump(void);
 void cocoa_window_set_fullscreen(void *hwnd, bool fullscreen);
 bool cocoa_window_is_fullscreen(void *hwnd);
+void icon_apply(void); // the game's own icon, in the Dock
+bool icon_write_png(const char *path);
 void cocoa_window_size(void *hwnd, int *w, int *h);  // backing pixels
 void *cocoa_window_view(void *hwnd, double *scale);  // the content NSView
 void cocoa_set_title(void *hwnd, const char *title); // any thread

@@ -23,7 +23,9 @@ make run GAME="$HOME/Games/Order of the Sinking Star"
 ```
 
 `make run` launches the game from an app bundle (`make app` builds `build/Order of the Sinking Star.app`),
-which declares it a game so macOS can apply Game Mode. The game starts fullscreen as a borderless window with
+which declares it a game so macOS can apply Game Mode. The Dock shows the game's own icon, read from its
+executable when it starts; `make app GAME=...` also saves it as the bundle's Finder icon. The icon is never
+stored in this repository. The game starts fullscreen as a borderless window with
 the Dock and menu bar hidden; `LOADER_WINDOWED=1` starts windowed. Only one copy can run at a time. Saves go
 to `~/Library/Application Support/Order of the Sinking Star`.
 

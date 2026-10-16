@@ -293,6 +293,14 @@ int main(int argc, char **argv) {
     log_time(); // start the clock
     g_trace = getenv("LOADER_TRACE") != NULL;
     require_single_instance();
+    if (argc > 3 && !strcmp(argv[1], "--extract-icon")) { // used by `make app`: --extract-icon out.png game.exe
+        if (!realpath(argv[3], g_exe_unix_path)) {
+            perror(argv[3]);
+            return 1;
+        }
+        load_pe(g_exe_unix_path);
+        return icon_write_png(argv[2]) ? 0 : 1;
+    }
     const char *exe = argc > 1 ? argv[1] : "sinking_star.exe";
     if (!realpath(exe, g_exe_unix_path)) {
         perror(exe);
@@ -316,6 +324,7 @@ int main(int argc, char **argv) {
     cocoa_init();
     d3d_backend_init();
     int(WINAPI * entry)(void) = load_pe(g_exe_unix_path);
+    icon_apply();
     teb_setup_current_thread();
 
     LOG("starting %s", g_exe_unix_path);
