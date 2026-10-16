@@ -12,21 +12,12 @@ Metal for graphics. Everything runs under Rosetta 2.
 
 - An Apple Silicon Mac with macOS 15 or later and Rosetta 2 (`softwareupdate --install-rosetta`)
 - Xcode Command Line Tools
-- Your own copy of the game: the Windows build from Steam
-
-## Get the game files
-
-Download the Windows build with your Steam account (Steam is not needed to play):
-
-```sh
-steamcmd +@sSteamCmdForcePlatformType windows +force_install_dir "$HOME/Games/Order of the Sinking Star" \
-         +login <your_steam_user> +app_update <appid> validate +quit
-```
+- Your own copy of the game: the Windows build from Steam (the folder containing `sinking_star.exe`)
 
 ## Build and run
 
 ```sh
-make msc     # fetches Apple's Metal Shader Converter (not bundled; it converts the game's shaders)
+make msc     # downloads Apple's Metal Shader Converter library (not bundled; checked against a pinned SHA-256)
 make
 make run GAME="$HOME/Games/Order of the Sinking Star"
 ```
@@ -101,6 +92,7 @@ saves), the clipboard. Steam is stubbed as "running, offline".
 | `src/input.m` | Keyboard, mouse and Raw Input |
 | `src/audio.c` | MMDevice/WASAPI on CoreAudio (for the game's Wwise) |
 | `src/d3d.m` | Chooses the graphics backend (ours, or D3DMetal as a fallback) |
+| `third_party/` | Vendored headers: Microsoft's DirectX-Headers (MIT) and Apple's Metal Shader Converter headers (Apache-2.0) |
 | `src/d3d12/` | D3D12 and DXGI on Metal: `device.m`, `dxgi.m`, `queue.m`, `list.m` (recording), `replay.m` (Metal encoders), `resource.m`, `descriptor.m`, `rootsig.m`, `pipeline.m`, `shader.m` (converter and cache), `binding.m` (Apple's runtime header), `profile.m` |
 | `resources/Info.plist` | Game Mode and app metadata, embedded in the executable and the app bundle |
 | `src/misc.c` | Registry, COM, shell, dbghelp |

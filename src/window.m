@@ -124,6 +124,7 @@ void cocoa_init(void) {
         activity =
             [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical
                                                          reason:@"Running the game"];
+        (void)activity; // held for the life of the process
     }
 }
 
