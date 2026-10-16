@@ -191,7 +191,8 @@ void d3d_backend_init(void) {
     if (!e) snprintf(lib, sizeof lib, "%s/libd3dmetal-native.dylib", dir);
     void *h = dlopen(lib, RTLD_NOW);
     if (!h) {
-        fprintf(stderr, "error: cannot load %s: %s\n", lib, dlerror());
+        fprintf(stderr, "error: cannot load %s: %s\nBuild it with `make d3dmetal`, or drop LOADER_D3D=d3dmetal.\n", lib,
+                dlerror());
         exit(1);
     }
 #define SYM(field, name) dmn.field = dlsym(h, name)

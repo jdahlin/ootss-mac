@@ -31,7 +31,10 @@ SRCS := $(wildcard src/*.c src/*.m src/d3d12/*.c src/d3d12/*.m)
 OBJS := $(patsubst src/%,build/obj/%.o,$(SRCS))
 HDRS := $(wildcard src/*.h src/d3d12/*.h)
 
-all: build/sinking-star build/libd3dmetal-native.dylib build/libmetalirconverter.dylib
+all: build/sinking-star build/libmetalirconverter.dylib
+
+# Optional: Apple's D3DMetal as a fallback graphics backend (LOADER_D3D=d3dmetal). Loaded with dlopen at run time.
+d3dmetal: build/libd3dmetal-native.dylib
 
 # The Info.plist is embedded so even the bare executable identifies itself as a game.
 build/sinking-star: $(OBJS) resources/Info.plist
@@ -42,7 +45,8 @@ APP := build/Order of the Sinking Star.app
 app: all
 	@mkdir -p "$(APP)/Contents/MacOS"
 	cp resources/Info.plist "$(APP)/Contents/Info.plist"
-	cp build/sinking-star build/libd3dmetal-native.dylib build/libmetalirconverter.dylib "$(APP)/Contents/MacOS/"
+	cp build/sinking-star build/libmetalirconverter.dylib "$(APP)/Contents/MacOS/"
+	@test ! -e build/libd3dmetal-native.dylib || cp build/libd3dmetal-native.dylib "$(APP)/Contents/MacOS/"
 	@test ! -e build/D3DMetal.framework || ln -sfn "$(CURDIR)/build/D3DMetal.framework" "$(APP)/Contents/MacOS/D3DMetal.framework"
 	codesign --force --deep -s - "$(APP)"
 
@@ -117,4 +121,4 @@ clean:
 distclean: clean
 	rm -rf deps
 
-.PHONY: app all run msc format lint clean distclean
+.PHONY: app d3dmetal all run msc format lint clean distclean

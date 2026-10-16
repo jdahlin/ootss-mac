@@ -53,8 +53,9 @@ typed buffer views, queries and timestamps.
 
 `LOADER_D3D=d3dmetal` uses Apple's D3DMetal instead. Download the Game Porting Toolkit from Apple, copy
 `D3DMetal.framework` to `build/D3DMetal.framework` (or set `D3DMETAL_FRAMEWORK_PATH`), and
-`xattr -dr com.apple.quarantine` it if macOS blocks it. `make` also builds
-[d3dmetal-native](https://github.com/utmapp/d3dmetal-native) (MIT) to host it (`brew install meson ninja`).
+`xattr -dr com.apple.quarantine` it if macOS blocks it. Then `make d3dmetal` builds
+[d3dmetal-native](https://github.com/utmapp/d3dmetal-native) (MIT), which hosts it; the loader opens it with
+`dlopen` only when this backend is selected (`brew install meson ninja`).
 
 ## Options
 
