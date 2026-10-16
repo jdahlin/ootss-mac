@@ -183,7 +183,7 @@ static NSData *convert(const D3D12_SHADER_BYTECODE *code, const RootSignature *r
 
     uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     IRCompiler *compiler = g_api.CompilerCreate();
-    g_api.CompilerSetMinimumDeploymentTarget(compiler, IROperatingSystem_macOS, "14.0");
+    g_api.CompilerSetMinimumDeploymentTarget(compiler, IROperatingSystem_macOS, "15.0");
     if (root && root->ir) g_api.CompilerSetGlobalRootSignature(compiler, root->ir);
     IRObject *input = g_api.ObjectCreateFromDXIL(dxbc, code->BytecodeLength, IRBytecodeOwnershipNone);
     IRError *error = NULL;

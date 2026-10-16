@@ -274,14 +274,14 @@ SHIM(short, GetAsyncKeyState, int vk) {
 static LPARAM mouse_position(NSEvent *e) {
     NSView *view = g_window->ns.contentView;
     NSPoint p = [view convertPoint:e.locationInWindow fromView:nil];
-    CGFloat scale = g_window->ns.backingScaleFactor;
+    CGFloat scale = game_scale(g_window);
     int x = p.x * scale, y = (view.bounds.size.height - p.y) * scale; // origin at the top left
     return (LPARAM)(uint16_t)x | (LPARAM)(uint16_t)y << 16;
 }
 
 static bool handle_mouse_move(NSEvent *e) {
     if (!g_raw_mouse_only) post_message(g_window, WM_MOUSEMOVE, g_mouse_buttons, mouse_position(e));
-    CGFloat scale = g_window->ns.backingScaleFactor;
+    CGFloat scale = g_window->ns.backingScaleFactor; // raw motion is in device pixels, whatever the render scale
     post_raw_mouse(lround(e.deltaX * scale), lround(e.deltaY * scale), 0, 0);
     return false; // AppKit still tracks the cursor
 }
@@ -388,7 +388,7 @@ SHIM(WBOOL, ClipCursor, const RECT *rect) {
 
 SHIM(WBOOL, GetCursorPos, POINT *p) {
     NSPoint mouse = NSEvent.mouseLocation; // bottom-left origin, in points
-    CGFloat scale = NSScreen.mainScreen.backingScaleFactor;
+    CGFloat scale = game_scale(NULL);
     p->x = mouse.x * scale;
     p->y = (NSScreen.screens[0].frame.size.height - mouse.y) * scale;
     return true;

@@ -66,6 +66,11 @@ typedef struct Replay {
     bool has_depth;
     bool targets_open; // the open render encoder draws to the current targets
 
+    Profile *profile;
+    int pass_slot;                // profile slot of the open encoder, or -1
+    unsigned pass_count;          // draws or dispatches in the open encoder
+    PipelineState *pass_pipeline; // the compute shader of the open compute encoder (profiling)
+
     PendingClear pending[PENDING_CLEARS_MAX];
     int pending_count;
 } Replay;
@@ -161,6 +166,26 @@ static void end_encoder(Replay *r) {
     case ENCODER_NONE: return;
     }
     [e endEncoding];
+    if (r->profile && r->pass_slot >= 0) {
+        char key[64];
+        if (was_render && probed.resource && probed.resource->texture)
+            snprintf(key, sizeof key, "render %lux%lu fmt %lu x%lu%s", (unsigned long)probed.resource->texture.width,
+                     (unsigned long)probed.resource->texture.height,
+                     (unsigned long)probed.resource->texture.pixelFormat,
+                     (unsigned long)probed.resource->texture.sampleCount, r->has_depth ? "+depth" : "");
+        else if (was_render)
+            snprintf(key, sizeof key, "render (clear or resolve)");
+        else
+            snprintf(key, sizeof key, "%s", r->kind == ENCODER_COMPUTE ? "compute" : "blit");
+        if (r->kind == ENCODER_COMPUTE && r->pass_pipeline)
+            snprintf(key, sizeof key, "compute %08x %lux%lux%lu", r->pass_pipeline->id,
+                     (unsigned long)r->pass_pipeline->threads_per_group.width,
+                     (unsigned long)r->pass_pipeline->threads_per_group.height,
+                     (unsigned long)r->pass_pipeline->threads_per_group.depth);
+        profile_label(r->profile, r->pass_slot, key, r->pass_count);
+    }
+    r->pass_slot = -1;
+    r->pass_count = 0;
     r->queue->fence_used = true;
     r->kind = ENCODER_NONE;
     r->render = nil;
@@ -172,6 +197,14 @@ static void end_encoder(Replay *r) {
 
 static id<MTLRenderCommandEncoder> open_render(Replay *r, MTLRenderPassDescriptor *pass) {
     end_encoder(r);
+    if (r->profile && (r->pass_slot = profile_slot(r->profile)) >= 0) {
+        MTLRenderPassSampleBufferAttachmentDescriptor *a = pass.sampleBufferAttachments[0];
+        a.sampleBuffer = profile_samples(r->profile);
+        a.startOfVertexSampleIndex = 2 * r->pass_slot;
+        a.endOfVertexSampleIndex = MTLCounterDontSample;
+        a.startOfFragmentSampleIndex = MTLCounterDontSample;
+        a.endOfFragmentSampleIndex = 2 * r->pass_slot + 1;
+    }
     id<MTLRenderCommandEncoder> e = [r->cb renderCommandEncoderWithDescriptor:pass];
     if (r->queue->fence_used && !fences_disabled()) [e waitForFence:r->queue->fence beforeStages:MTLRenderStageVertex];
     g_stats.passes++;
@@ -184,7 +217,13 @@ static id<MTLRenderCommandEncoder> open_render(Replay *r, MTLRenderPassDescripto
 static id<MTLComputeCommandEncoder> compute_encoder(Replay *r) {
     if (r->kind == ENCODER_COMPUTE) return r->compute;
     end_encoder(r);
-    r->compute = [r->cb computeCommandEncoder];
+    MTLComputePassDescriptor *pass = [MTLComputePassDescriptor computePassDescriptor];
+    if (r->profile && (r->pass_slot = profile_slot(r->profile)) >= 0) {
+        pass.sampleBufferAttachments[0].sampleBuffer = profile_samples(r->profile);
+        pass.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2 * r->pass_slot;
+        pass.sampleBufferAttachments[0].endOfEncoderSampleIndex = 2 * r->pass_slot + 1;
+    }
+    r->compute = [r->cb computeCommandEncoderWithDescriptor:pass];
     if (r->queue->fence_used && !fences_disabled()) [r->compute waitForFence:r->queue->fence];
     r->kind = ENCODER_COMPUTE;
     r->compute_dirty = DIRTY_ALL;
@@ -194,7 +233,13 @@ static id<MTLComputeCommandEncoder> compute_encoder(Replay *r) {
 static id<MTLBlitCommandEncoder> blit_encoder(Replay *r) {
     if (r->kind == ENCODER_BLIT) return r->blit;
     end_encoder(r);
-    r->blit = [r->cb blitCommandEncoder];
+    MTLBlitPassDescriptor *pass = [MTLBlitPassDescriptor blitPassDescriptor];
+    if (r->profile && (r->pass_slot = profile_slot(r->profile)) >= 0) {
+        pass.sampleBufferAttachments[0].sampleBuffer = profile_samples(r->profile);
+        pass.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2 * r->pass_slot;
+        pass.sampleBufferAttachments[0].endOfEncoderSampleIndex = 2 * r->pass_slot + 1;
+    }
+    r->blit = [r->cb blitCommandEncoderWithDescriptor:pass];
     if (r->queue->fence_used && !fences_disabled()) [r->blit waitForFence:r->queue->fence];
     r->kind = ENCODER_BLIT;
     return r->blit;
@@ -464,10 +509,12 @@ static void apply_render_state(Replay *r) {
 static bool prepare_draw_checked(Replay *r);
 static bool prepare_draw(Replay *r) {
     bool ok = prepare_draw_checked(r);
-    if (ok)
+    if (ok) {
         g_stats.draws++;
-    else
+        r->pass_count++;
+    } else {
         g_stats.skipped++;
+    }
     return ok;
 }
 
@@ -577,6 +624,9 @@ static void do_dispatch(Replay *r, const Command *c) {
     }
     flush_clears(r);
     g_stats.dispatches++;
+    if (r->profile && r->kind == ENCODER_COMPUTE && r->pass_pipeline != p) end_encoder(r); // one label per shader
+    r->pass_pipeline = p;
+    r->pass_count++;
     id<MTLComputeCommandEncoder> e = compute_encoder(r);
     unsigned dirty = r->compute_dirty;
     r->compute_dirty = 0;
@@ -846,6 +896,8 @@ void command_list_execute(CommandList *list, CommandQueue *queue, id<MTLCommandB
     Replay *r = calloc(1, sizeof *r);
     r->queue = queue;
     r->cb = cb;
+    r->profile = profile_for(cb);
+    r->pass_slot = -1;
     r->topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     replay_commands(r, list);
     flush_clears(r);

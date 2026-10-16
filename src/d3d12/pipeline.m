@@ -287,6 +287,7 @@ HRESULT graphics_pipeline_create(Device *device, const D3D12_GRAPHICS_PIPELINE_S
 
 HRESULT compute_pipeline_create(Device *device, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID iid, void **out) {
     PipelineState *p = pipeline_new(device, true);
+    if (desc->CS.BytecodeLength >= 20) memcpy(&p->id, (const uint8_t *)desc->CS.pShaderBytecode + 4, sizeof p->id);
     NSString *name = nil;
     ShaderInfo info = {0};
     id<MTLLibrary> lib =

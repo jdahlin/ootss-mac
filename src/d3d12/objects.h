@@ -141,6 +141,7 @@ typedef struct PipelineState {
     UINT sample_count;
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
     bool valid;
+    uint32_t id; // first bytes of the compute shader hash, for profiling
 } PipelineState;
 
 // Converts DXIL to a Metal library through Apple's Metal Shader Converter (see shader.m).
@@ -181,6 +182,14 @@ typedef struct CommandQueue {
     id<MTLFence> fence; // orders encoders: every encoder waits for the previous one
     bool fence_used;
 } CommandQueue;
+
+// GPU profiling (profile.m): encoders are bracketed by timestamps and labelled; see D3D12_PROFILE.
+typedef struct Profile Profile;
+Profile *profile_for(id<MTLCommandBuffer> cb); // NULL when profiling is off
+id<MTLCounterSampleBuffer> profile_samples(Profile *p);
+int profile_slot(Profile *p); // -1 when full
+void profile_label(Profile *p, int slot, const char *key, uint32_t count);
+void profile_finish(Profile *p, id<MTLCommandBuffer> cb); // registers the completion handler, before commit
 
 // Replays a recorded list into a Metal command buffer on the queue.
 void command_list_execute(CommandList *list, CommandQueue *queue, id<MTLCommandBuffer> cb);

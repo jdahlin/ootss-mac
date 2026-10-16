@@ -91,6 +91,7 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(CommandQueue *q, UINT co
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [q->mtl commandBuffer];
         for (UINT i = 0; i < count; i++) command_list_execute((CommandList *)lists[i], q, cb);
+        profile_finish(profile_for(cb), cb);
         commit(cb);
     }
 }

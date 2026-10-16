@@ -13,8 +13,25 @@ static LRESULT send_message(Window *w, UINT message, WPARAM wparam, LPARAM lpara
     return w->proc(w, message, wparam, lparam);
 }
 
+// Pixels per point as the game sees them: the screen's backing scale times LOADER_RENDER_SCALE. A scale below 1
+// makes the game render fewer pixels than the screen has, which the layer stretches to fit (faster, softer).
+CGFloat render_scale(void) {
+    static CGFloat scale;
+    if (!scale) {
+        const char *env = getenv("LOADER_RENDER_SCALE");
+        scale = env && atof(env) > 0.1 && atof(env) <= 1.0 ? atof(env) : 1.0;
+    }
+    return scale;
+}
+
+CGFloat game_scale(Window *w) {
+    return (w ? w->ns.backingScaleFactor : NSScreen.mainScreen.backingScaleFactor) * render_scale();
+}
+
 NSSize client_size_in_pixels(Window *w) {
-    return [w->ns.contentView convertRectToBacking:w->ns.contentView.bounds].size;
+    NSSize points = w->ns.contentView.bounds.size;
+    CGFloat scale = game_scale(w);
+    return NSMakeSize(round(points.width * scale), round(points.height * scale));
 }
 
 static LPARAM size_lparam(Window *w) {
@@ -91,7 +108,7 @@ void post_message(Window *w, UINT message, WPARAM wparam, LPARAM lparam) {
 
 - (void)windowDidResize:(NSNotification *)notification {
     NSSize size = client_size_in_pixels(self.window);
-    if (g_window_resized) g_window_resized(self.window, size.width, size.height, self.window->ns.backingScaleFactor);
+    if (g_window_resized) g_window_resized(self.window, size.width, size.height, game_scale(self.window));
     post_message(self.window, WM_SIZE, 0, size_lparam(self.window));
 }
 @end
@@ -168,7 +185,7 @@ void cocoa_window_size(void *hwnd, int *w, int *h) {
 
 void *cocoa_window_view(void *hwnd, double *scale) {
     Window *w = hwnd ? hwnd : g_window;
-    if (scale) *scale = w->ns.backingScaleFactor;
+    if (scale) *scale = game_scale(w);
     return (__bridge void *)w->ns.contentView;
 }
 
@@ -214,7 +231,7 @@ static WNDPROC find_class_proc(const WCHAR *name) {
 
 // ---------------------------------------------------------------- windows
 static NSWindow *create_ns_window(const char *title, int pixel_width, int pixel_height, Window *owner) {
-    CGFloat scale = NSScreen.mainScreen.backingScaleFactor; // the window opens on the main screen
+    CGFloat scale = game_scale(NULL); // the window opens on the main screen
     NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
                               NSWindowStyleMaskResizable;
     NSWindow *ns = [[GameWindow alloc] initWithContentRect:NSMakeRect(0, 0, pixel_width / scale, pixel_height / scale)
@@ -313,7 +330,7 @@ SHIM(WBOOL, SetWindowPos, Window *w, HWND insert_after, int x, int y, int width,
     if (!w) return false;
     LOG("SetWindowPos(%d,%d %dx%d flags 0x%x)", x, y, width, height, flags);
     if (!(flags & SWP_NOSIZE) && width > 0 && height > 0) {
-        CGFloat scale = w->ns.backingScaleFactor;
+        CGFloat scale = game_scale(w);
         [w->ns setContentSize:NSMakeSize(width / scale, height / scale)];
     }
     return true;
@@ -367,7 +384,7 @@ SHIM(WBOOL, AdjustWindowRect, RECT *rect, DWORD style, WBOOL menu) {
 static NSPoint client_origin_on_screen(Window *w) {
     NSView *view = w->ns.contentView;
     NSRect r = [w->ns convertRectToScreen:[view convertRect:view.bounds toView:nil]];
-    CGFloat scale = w->ns.backingScaleFactor, screen_height = NSScreen.screens[0].frame.size.height;
+    CGFloat scale = game_scale(w), screen_height = NSScreen.screens[0].frame.size.height;
     return NSMakePoint(r.origin.x * scale, (screen_height - (r.origin.y + r.size.height)) * scale);
 }
 
