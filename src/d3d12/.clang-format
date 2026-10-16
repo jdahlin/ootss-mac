@@ -1,0 +1,3 @@
+BasedOnStyle: InheritParentConfig
+# The Windows adapter header must precede d3d12.h; do not reorder includes here.
+SortIncludes: Never

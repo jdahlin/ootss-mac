@@ -46,6 +46,19 @@ make run GAME="$HOME/Games/Order of the Sinking Star"
 `make` also fetches and builds [d3dmetal-native](https://github.com/utmapp/d3dmetal-native) (MIT), which
 hosts D3DMetal outside Wine. Saves go to `~/Library/Application Support/Order of the Sinking Star`.
 
+## Native D3D12 backend (work in progress)
+
+`LOADER_D3D=native` replaces D3DMetal with our own D3D12 and DXGI on Metal (`src/d3d12/`), which would
+remove the Apple dependency and the x86_64 restriction. It already creates the device, queues, fences,
+swapchain (via `CAMetalLayer`), heaps, resources and descriptors, runs the game's whole frame loop and
+records its commands. Shaders, pipelines and draws are not implemented yet, so nothing renders.
+
+Shaders are translated from the game's own DXIL at run time by Apple's Metal Shader Converter
+(`make msc` fetches it). The first launch converts all 257 of them, which takes a few seconds; the results
+are cached in `~/Library/Caches/ootss-mac/shaders` (about 4 MB, keyed by the shader's hash and the converter
+build) so later launches skip it. Delete that folder to force a fresh conversion. Nothing derived from the
+game is stored in this repository or in the build.
+
 ## Options
 
 | Variable | Effect |
