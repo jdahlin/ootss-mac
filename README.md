@@ -2,6 +2,8 @@
 
 Runs the Windows build of *Order of the Sinking Star* on Apple Silicon Macs without Wine.
 
+![The game running on an M4 MacBook at ~49 fps](docs/screenshot.webp)
+
 A small x86_64 loader maps `sinking_star.exe` into memory and implements the ~300 Windows functions it
 imports on top of macOS: Cocoa for the window and input, CoreAudio for sound, and Apple's D3DMetal
 (from the Game Porting Toolkit) for Direct3D 12. Everything runs under Rosetta 2.
