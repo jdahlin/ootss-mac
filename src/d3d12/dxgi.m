@@ -327,11 +327,13 @@ static HRESULT STDMETHODCALLTYPE swapchain_GetHwnd(SwapChain *s, void **hwnd) {
 }
 
 static HRESULT STDMETHODCALLTYPE swapchain_SetFullscreenState(SwapChain *s, WINBOOL fullscreen, void *target) {
-    return S_OK; // the game stays windowed; macOS window management does the rest
+    D3D_LOG("SetFullscreenState(%d)", fullscreen);
+    cocoa_window_set_fullscreen(s->hwnd, fullscreen); // the game then sees the window grow and resizes its buffers
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE swapchain_GetFullscreenState(SwapChain *s, WINBOOL *fullscreen, void **target) {
-    if (fullscreen) *fullscreen = FALSE;
+    if (fullscreen) *fullscreen = cocoa_window_is_fullscreen(s->hwnd);
     if (target) *target = NULL;
     return S_OK;
 }

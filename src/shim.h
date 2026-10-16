@@ -101,6 +101,8 @@ HRESULT audio_create_instance(const GUID *clsid, const GUID *iid, void **out);
 // ---- Cocoa (user32.m)
 void cocoa_init(void);
 void cocoa_pump(void);
+void cocoa_window_set_fullscreen(void *hwnd, bool fullscreen);
+bool cocoa_window_is_fullscreen(void *hwnd);
 void cocoa_window_size(void *hwnd, int *w, int *h);  // backing pixels
 void *cocoa_window_view(void *hwnd, double *scale);  // the content NSView
 void cocoa_set_title(void *hwnd, const char *title); // any thread

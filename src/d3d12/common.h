@@ -39,6 +39,8 @@ void shim_register(const char *name, void *fn);
 void *shim_lookup(const char *name);
 void *make_tagged_thunk(uint32_t tag, void *target);
 void *cocoa_window_view(void *hwnd, double *scale);
+void cocoa_window_set_fullscreen(void *hwnd, bool fullscreen);
+bool cocoa_window_is_fullscreen(void *hwnd);
 void cocoa_window_size(void *hwnd, int *w, int *h);
 
 #define D3D_LOG(...)                                                                                                   \

@@ -98,6 +98,25 @@ void cocoa_pump(void) {
     }
 }
 
+// Native macOS fullscreen: the window fills the screen in its own Space, and the game sees the client size grow.
+void cocoa_window_set_fullscreen(void *hwnd, bool fullscreen) {
+    Window *w = hwnd ? hwnd : g_window;
+    if (!w) return;
+    void (^toggle)(void) = ^{
+      bool is_fullscreen = (w->ns.styleMask & NSWindowStyleMaskFullScreen) != 0;
+      if (is_fullscreen != fullscreen) [w->ns toggleFullScreen:nil];
+    };
+    if ([NSThread isMainThread])
+        toggle();
+    else
+        dispatch_async(dispatch_get_main_queue(), toggle);
+}
+
+bool cocoa_window_is_fullscreen(void *hwnd) {
+    Window *w = hwnd ? hwnd : g_window;
+    return w && (w->ns.styleMask & NSWindowStyleMaskFullScreen);
+}
+
 void cocoa_window_size(void *hwnd, int *w, int *h) {
     NSSize size = client_size_in_pixels(hwnd ? hwnd : g_window);
     *w = size.width;
@@ -212,6 +231,19 @@ SHIM(HWND, CreateWindowExW, DWORD ex_style, const WCHAR *class_name, const WCHAR
     if (style & WS_VISIBLE) {
         [w->ns makeKeyAndOrderFront:nil];
         cocoa_pump();
+    }
+    // The game runs fullscreen unless LOADER_WINDOWED is set. Wait for the transition so the size the game
+    // reads next is the final one.
+    if (!getenv("LOADER_WINDOWED")) {
+        cocoa_window_set_fullscreen(w, true);
+        for (int i = 0; i < 200 && !cocoa_window_is_fullscreen(w); i++) {
+            cocoa_pump();
+            usleep(10000);
+        }
+        for (int i = 0; i < 100; i++) { // the animation continues after the style flag flips
+            cocoa_pump();
+            usleep(10000);
+        }
     }
     return w;
 }

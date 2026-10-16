@@ -144,6 +144,9 @@ static OSStatus render(void *context, AudioUnitRenderActionFlags *flags, const A
     static int muted = -1; // LOADER_MUTE=1: keep the game's audio clock running but output silence
     if (muted < 0) muted = getenv("LOADER_MUTE") != NULL;
     if (muted) memset(out, 0, frames * CHANNELS * sizeof(float));
+    static atomic_bool reported; // a one-time sign that the game's sound reaches the device
+    for (uint32_t i = 0; take && i < take * CHANNELS && !atomic_load(&reported); i++)
+        if (out[i] != 0.0f && !atomic_exchange(&reported, true)) LOG("audio: first non-silent output");
     atomic_store_explicit(&c->played, played + take, memory_order_release);
     if (c->event_driven && c->event) g_set_event(c->event);
     return noErr;
