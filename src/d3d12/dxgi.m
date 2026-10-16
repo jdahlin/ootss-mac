@@ -295,6 +295,7 @@ static UINT STDMETHODCALLTYPE swapchain_GetCurrentBackBufferIndex(SwapChain *s) 
 
 static HRESULT STDMETHODCALLTYPE swapchain_ResizeBuffers(SwapChain *s, UINT count, UINT width, UINT height,
                                                          DXGI_FORMAT format, UINT flags) {
+    D3D_LOG("ResizeBuffers(%u, %ux%u)", count, width, height);
     if (!width || !height) {
         int w, h;
         cocoa_window_size(s->hwnd, &w, &h);

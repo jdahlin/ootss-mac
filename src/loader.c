@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/ucontext.h>
@@ -276,9 +277,22 @@ static void install_crash_handler(void) {
 }
 
 // ---------------------------------------------------------------- main
+// Two copies would fight over the save files, the audio device and the GPU. The lock is released by the
+// system when the process exits, however it exits.
+static void require_single_instance(void) {
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/ootss-mac.%u.lock", getuid());
+    int fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB)) {
+        fprintf(stderr, "Another copy of the game is already running.\n");
+        exit(1);
+    } // fd stays open for the life of the process
+}
+
 int main(int argc, char **argv) {
     log_time(); // start the clock
     g_trace = getenv("LOADER_TRACE") != NULL;
+    require_single_instance();
     const char *exe = argc > 1 ? argv[1] : "sinking_star.exe";
     if (!realpath(exe, g_exe_unix_path)) {
         perror(exe);

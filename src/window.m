@@ -250,6 +250,7 @@ SHIM(HWND, CreateWindowExW, DWORD ex_style, const WCHAR *class_name, const WCHAR
 
 SHIM(WBOOL, ShowWindow, Window *w, int command) {
     if (!w) return false;
+    LOG("ShowWindow(%d)", command);
     if (command)
         [w->ns makeKeyAndOrderFront:nil];
     else
@@ -272,6 +273,7 @@ SHIM(WBOOL, SetWindowTextW, Window *w, const WCHAR *text) {
 
 SHIM(WBOOL, SetWindowPos, Window *w, HWND insert_after, int x, int y, int width, int height, UINT flags) {
     if (!w) return false;
+    LOG("SetWindowPos(%d,%d %dx%d flags 0x%x)", x, y, width, height, flags);
     if (!(flags & SWP_NOSIZE) && width > 0 && height > 0) {
         CGFloat scale = w->ns.backingScaleFactor;
         [w->ns setContentSize:NSMakeSize(width / scale, height / scale)];
@@ -292,6 +294,7 @@ SHIM(intptr_t, SetWindowLongPtrW, Window *w, int index, intptr_t value) {
 
 SHIM(LONG, SetWindowLongW, Window *w, int index, LONG value) {
     if (!w || !valid_long_index(index)) return 0;
+    LOG("SetWindowLong(%d, 0x%x)", index, (unsigned)value);
     LONG previous = (LONG)w->longs[-index];
     w->longs[-index] = value;
     return previous;
