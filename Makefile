@@ -33,8 +33,18 @@ HDRS := $(wildcard src/*.h src/d3d12/*.h)
 
 all: build/sinking-star build/libd3dmetal-native.dylib build/libmetalirconverter.dylib
 
-build/sinking-star: $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^
+# The Info.plist is embedded so even the bare executable identifies itself as a game.
+build/sinking-star: $(OBJS) resources/Info.plist
+	$(CC) $(LDFLAGS) -Wl,-sectcreate,__TEXT,__info_plist,resources/Info.plist -o $@ $(OBJS)
+
+# A real app bundle, which is what macOS needs to offer Game Mode. The libraries sit beside the executable.
+APP := build/Order of the Sinking Star.app
+app: all
+	@mkdir -p "$(APP)/Contents/MacOS"
+	cp resources/Info.plist "$(APP)/Contents/Info.plist"
+	cp build/sinking-star build/libd3dmetal-native.dylib build/libmetalirconverter.dylib "$(APP)/Contents/MacOS/"
+	@test ! -e build/D3DMetal.framework || ln -sfn "$(CURDIR)/build/D3DMetal.framework" "$(APP)/Contents/MacOS/D3DMetal.framework"
+	codesign --force --deep -s - "$(APP)"
 
 build/obj/d3d12/%.c.o: src/d3d12/%.c $(HDRS) | $(DXH_SRC) $(MSC_SRC)
 	@mkdir -p $(dir $@)
@@ -97,9 +107,9 @@ build/libd3dmetal-native.dylib: | $(DMN_SRC)
 	meson compile -C build/d3dmetal-native
 	cp build/d3dmetal-native/libd3dmetal-native.dylib $@
 
-run: all
+run: app
 	@test -n "$(GAME)" || { echo 'usage: make run GAME="/path/to/Order of the Sinking Star"'; exit 1; }
-	build/sinking-star "$(GAME)/sinking_star.exe"
+	"$(APP)/Contents/MacOS/sinking-star" "$(GAME)/sinking_star.exe"
 
 clean:
 	rm -rf build compile_commands.json
@@ -107,4 +117,4 @@ clean:
 distclean: clean
 	rm -rf deps
 
-.PHONY: all run msc format lint clean distclean
+.PHONY: app all run msc format lint clean distclean

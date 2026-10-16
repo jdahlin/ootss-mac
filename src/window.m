@@ -48,6 +48,24 @@ void post_message(Window *w, UINT message, WPARAM wparam, LPARAM lparam) {
 }
 
 // ---------------------------------------------------------------- Cocoa
+// A borderless window refuses key status by default, and AppKit moves windows out from under the menu bar
+// and the camera housing; fullscreen needs both overridden.
+@interface GameWindow : NSWindow
+@property(assign) BOOL fullscreen;
+@end
+
+@implementation GameWindow
+- (BOOL)canBecomeKeyWindow {
+    return YES;
+}
+- (BOOL)canBecomeMainWindow {
+    return YES;
+}
+- (NSRect)constrainFrameRect:(NSRect)frame toScreen:(NSScreen *)screen {
+    return self.fullscreen ? frame : [super constrainFrameRect:frame toScreen:screen];
+}
+@end
+
 @interface WindowDelegate : NSObject <NSWindowDelegate>
 @property(assign) Window *window;
 @end
@@ -84,6 +102,11 @@ void cocoa_init(void) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         [NSApp finishLaunching];
         [NSApp activateIgnoringOtherApps:YES];
+        // A game: no App Nap, no automatic termination, timers and threads scheduled for low latency.
+        static id activity;
+        activity =
+            [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical
+                                                         reason:@"Running the game"];
     }
 }
 
@@ -98,23 +121,43 @@ void cocoa_pump(void) {
     }
 }
 
-// Native macOS fullscreen: the window fills the screen in its own Space, and the game sees the client size grow.
+// Fullscreen is a borderless window over the whole screen (camera housing included) with the Dock and menu bar
+// hidden. Unlike macOS' own fullscreen it switches instantly, in the same Space.
+static NSRect g_windowed_frame;
+static NSWindowStyleMask g_windowed_style;
+
+static void apply_fullscreen(Window *w, bool fullscreen) {
+    GameWindow *ns = (GameWindow *)w->ns;
+    if (ns.fullscreen == fullscreen) return;
+    if (fullscreen) {
+        g_windowed_frame = ns.frame;
+        g_windowed_style = ns.styleMask;
+        NSScreen *screen = ns.screen ?: NSScreen.mainScreen;
+        ns.fullscreen = YES;
+        NSApp.presentationOptions = NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar;
+        ns.styleMask = NSWindowStyleMaskBorderless;
+        [ns setFrame:screen.frame display:YES animate:NO];
+    } else {
+        ns.fullscreen = NO;
+        NSApp.presentationOptions = NSApplicationPresentationDefault;
+        ns.styleMask = g_windowed_style;
+        [ns setFrame:g_windowed_frame display:YES animate:NO];
+    }
+    [ns makeKeyAndOrderFront:nil];
+}
+
 void cocoa_window_set_fullscreen(void *hwnd, bool fullscreen) {
     Window *w = hwnd ? hwnd : g_window;
     if (!w) return;
-    void (^toggle)(void) = ^{
-      bool is_fullscreen = (w->ns.styleMask & NSWindowStyleMaskFullScreen) != 0;
-      if (is_fullscreen != fullscreen) [w->ns toggleFullScreen:nil];
-    };
     if ([NSThread isMainThread])
-        toggle();
+        apply_fullscreen(w, fullscreen);
     else
-        dispatch_async(dispatch_get_main_queue(), toggle);
+        dispatch_async(dispatch_get_main_queue(), ^{ apply_fullscreen(w, fullscreen); });
 }
 
 bool cocoa_window_is_fullscreen(void *hwnd) {
     Window *w = hwnd ? hwnd : g_window;
-    return w && (w->ns.styleMask & NSWindowStyleMaskFullScreen);
+    return w && ((GameWindow *)w->ns).fullscreen;
 }
 
 void cocoa_window_size(void *hwnd, int *w, int *h) {
@@ -174,10 +217,10 @@ static NSWindow *create_ns_window(const char *title, int pixel_width, int pixel_
     CGFloat scale = NSScreen.mainScreen.backingScaleFactor; // the window opens on the main screen
     NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
                               NSWindowStyleMaskResizable;
-    NSWindow *ns = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, pixel_width / scale, pixel_height / scale)
-                                               styleMask:style
-                                                 backing:NSBackingStoreBuffered
-                                                   defer:NO];
+    NSWindow *ns = [[GameWindow alloc] initWithContentRect:NSMakeRect(0, 0, pixel_width / scale, pixel_height / scale)
+                                                 styleMask:style
+                                                   backing:NSBackingStoreBuffered
+                                                     defer:NO];
     ns.title = @(title);
     ns.releasedWhenClosed = NO;
     ns.acceptsMouseMovedEvents = YES;
@@ -232,18 +275,12 @@ SHIM(HWND, CreateWindowExW, DWORD ex_style, const WCHAR *class_name, const WCHAR
         [w->ns makeKeyAndOrderFront:nil];
         cocoa_pump();
     }
-    // The game runs fullscreen unless LOADER_WINDOWED is set. Wait for the transition so the size the game
-    // reads next is the final one.
+    // The game runs fullscreen unless LOADER_WINDOWED is set; the switch is instant, so the size the game
+    // reads next is already the final one.
     if (!getenv("LOADER_WINDOWED")) {
         cocoa_window_set_fullscreen(w, true);
-        for (int i = 0; i < 200 && !cocoa_window_is_fullscreen(w); i++) {
-            cocoa_pump();
-            usleep(10000);
-        }
-        for (int i = 0; i < 100; i++) { // the animation continues after the style flag flips
-            cocoa_pump();
-            usleep(10000);
-        }
+        cocoa_pump();
+        input_hide_cursor_until_game_decides();
     }
     return w;
 }

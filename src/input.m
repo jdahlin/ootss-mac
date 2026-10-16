@@ -352,7 +352,22 @@ SHIM(HANDLE, LoadCursorW, HANDLE instance, const WCHAR *name) { return (HANDLE)1
 SHIM(HANDLE, LoadIconW, HANDLE instance, const WCHAR *name) { return (HANDLE)1; }
 
 // The cursor is shown while the display counter is >= 0.
+static bool g_loader_hides_cursor; // hidden by us at startup, until the game first decides
+
+void input_hide_cursor_until_game_decides(void) {
+    if (g_loader_hides_cursor) return;
+    g_loader_hides_cursor = true;
+    [NSCursor hide];
+}
+
+static void release_loader_cursor_hide(void) {
+    if (!g_loader_hides_cursor) return;
+    g_loader_hides_cursor = false;
+    [NSCursor unhide];
+}
+
 SHIM(int, ShowCursor, WBOOL show) {
+    release_loader_cursor_hide();
     static int counter;
     int previous = counter;
     counter += show ? 1 : -1;
