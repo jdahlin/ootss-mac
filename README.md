@@ -31,8 +31,10 @@ make
 make run GAME="$HOME/Games/Order of the Sinking Star"
 ```
 
-Saves go to `~/Library/Application Support/Order of the Sinking Star`. The game starts fullscreen;
-`LOADER_WINDOWED=1` starts windowed. Only one copy can run at a time.
+`make run` launches the game from an app bundle (`make app` builds `build/Order of the Sinking Star.app`),
+which declares it a game so macOS can apply Game Mode. The game starts fullscreen as a borderless window with
+the Dock and menu bar hidden; `LOADER_WINDOWED=1` starts windowed. Only one copy can run at a time. Saves go
+to `~/Library/Application Support/Order of the Sinking Star`.
 
 ## Graphics
 
@@ -72,7 +74,9 @@ typed buffer views, queries and timestamps.
 | `D3D12_LOG_PRESENT=1` | Check that the back buffer is not black; `D3D12_DUMP_FRAME=file.ppm` saves a frame |
 | `D3D12_MAX_PRESENTS=n` | Exit after n frames (bounded debug runs) |
 | `D3D12_NO_PRESENT=1` | Never show frames (benchmarking) |
-| `DMN_VSYNC=1` | Sync presentation to the display (off by default for lower input latency) |
+| `D3D12_VSYNC=1` | Sync presentation to the display (off by default for lower input latency; `DMN_VSYNC` for D3DMetal) |
+| `D3D12_DUMP_SHADERS=dir` | Write every DXIL shader the game creates pipelines from (for study; do not commit) |
+| `D3D12_LOG_PSO=1`, `D3D12_LOG_ROOTSIG=1` | Log pipeline states and root signature layouts |
 | `MTL_HUD_ENABLED=1` | Apple's Metal performance HUD |
 
 Turn off Low Power Mode when playing; it roughly halves the frame rate.
@@ -97,6 +101,8 @@ saves), the clipboard. Steam is stubbed as "running, offline".
 | `src/input.m` | Keyboard, mouse and Raw Input |
 | `src/audio.c` | MMDevice/WASAPI on CoreAudio (for the game's Wwise) |
 | `src/d3d.m` | Chooses the graphics backend (ours, or D3DMetal as a fallback) |
+| `src/d3d12/` | D3D12 and DXGI on Metal: `device.m`, `dxgi.m`, `queue.m`, `list.m` (recording), `replay.m` (Metal encoders), `resource.m`, `descriptor.m`, `rootsig.m`, `pipeline.m`, `shader.m` (converter and cache), `binding.m` (Apple's runtime header), `profile.m` |
+| `resources/Info.plist` | Game Mode and app metadata, embedded in the executable and the app bundle |
 | `src/misc.c` | Registry, COM, shell, dbghelp |
 | `src/steam.c` | Steam, reported as running but offline |
 | `src/strings.c` | UTF-16, path and printf helpers |
