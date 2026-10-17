@@ -42,6 +42,8 @@ void *cocoa_window_view(void *hwnd, double *scale);
 void cocoa_window_set_fullscreen(void *hwnd, bool fullscreen);
 bool cocoa_window_is_fullscreen(void *hwnd);
 void cocoa_window_size(void *hwnd, int *w, int *h);
+void cpu_log_frame(void);
+void cpu_log_submit(void);
 
 #define D3D_LOG(...)                                                                                                   \
     do {                                                                                                               \

@@ -139,6 +139,7 @@ typedef struct PipelineState {
     MTLDepthClipMode depth_clip;
     float depth_bias, slope_scaled_depth_bias, depth_bias_clamp;
     UINT sample_count;
+    bool has_outputs; // writes a render target or depth; D3D12 allows drawing without, Metal needs a matching pass
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
     bool valid;
     uint32_t id; // first bytes of the compute shader hash, for profiling

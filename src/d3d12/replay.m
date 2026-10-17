@@ -64,7 +64,9 @@ typedef struct Replay {
     View colors[MAX_RENDER_TARGETS];
     View depth;
     bool has_depth;
-    bool targets_open; // the open render encoder draws to the current targets
+    bool targets_open;    // the open render encoder draws to the current targets
+    bool outputless_open; // the open render encoder is an attachment-less pass (see prepare_draw_checked)
+    UINT outputless_samples;
 
     Profile *profile;
     int pass_slot;                // profile slot of the open encoder, or -1
@@ -192,6 +194,7 @@ static void end_encoder(Replay *r) {
     r->compute = nil;
     r->blit = nil;
     r->targets_open = false;
+    r->outputless_open = false;
     if (was_render) probe_target(r, &probed, pass);
 }
 
@@ -524,7 +527,22 @@ static bool prepare_draw_checked(Replay *r) {
         D3D_TODO("draw without a usable graphics pipeline is skipped");
         return false;
     }
-    if (!ensure_render(r)) {
+    if (!p->has_outputs && (r->target_count || r->has_depth)) {
+        // A pipeline that writes nothing, drawn while targets are bound (only its side effects count). Metal
+        // needs the pass to match the pipeline, so it gets an attachment-less pass of the targets' size.
+        if (!r->outputless_open || r->outputless_samples != p->sample_count) {
+            const View *v = r->target_count && r->colors[0].resource ? &r->colors[0] : &r->depth;
+            id<MTLTexture> t = v->resource ? v->resource->texture : nil;
+            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.renderTargetWidth = t ? MAX(t.width >> v->mip, 1ul) : NO_ATTACHMENT_SIZE;
+            pass.renderTargetHeight = t ? MAX(t.height >> v->mip, 1ul) : NO_ATTACHMENT_SIZE;
+            pass.defaultRasterSampleCount = p->sample_count;
+            flush_clears(r);
+            open_render(r, pass);
+            r->outputless_open = true;
+            r->outputless_samples = p->sample_count;
+        }
+    } else if (!ensure_render(r)) {
         D3D_TODO("draw without render targets is skipped");
         return false;
     }

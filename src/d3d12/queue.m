@@ -85,6 +85,7 @@ static void commit(id<MTLCommandBuffer> cb) {
       if (done.error) D3D_LOG("command buffer failed: %s", done.error.localizedDescription.UTF8String);
     }];
     [cb commit];
+    cpu_log_submit();
 }
 
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(CommandQueue *q, UINT count, ID3D12CommandList *const *lists) {
@@ -102,6 +103,7 @@ static HRESULT STDMETHODCALLTYPE queue_Signal(CommandQueue *q, Fence *f, UINT64 
         id<MTLCommandBuffer> cb = [q->mtl commandBuffer];
         [cb encodeSignalEvent:f->event value:value];
         [cb commit];
+        cpu_log_submit();
     }
     return S_OK;
 }
@@ -111,6 +113,7 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(CommandQueue *q, Fence *f, UINT64 va
         id<MTLCommandBuffer> cb = [q->mtl commandBuffer];
         [cb encodeWaitForEvent:f->event value:value];
         [cb commit];
+        cpu_log_submit();
     }
     return S_OK;
 }

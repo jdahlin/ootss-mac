@@ -1,7 +1,9 @@
 // kernel32 synchronization: threads, events, semaphores, waits, critical sections and APCs.
 //
-// One global mutex and condition variable guard every waitable object we create. That keeps
-// WaitForMultipleObjects simple and correct, and the game waits rarely enough for it not to matter.
+// One global mutex guards every waitable object we create, which keeps WaitForMultipleObjects simple. Each
+// blocked thread sleeps on its own condition variable, and a signal wakes only threads waiting on that object:
+// one per released unit for auto-reset events and semaphores. (A single shared condition variable woke every
+// waiting thread on every signal; the game's ~24 job workers then cost a quarter of a core in the kernel.)
 // Event handles created by D3DMetal are not ours; waits involving them poll (see wait_with_foreign).
 #include "kernel32.h"
 #include <errno.h>
@@ -11,7 +13,19 @@
 #include <unistd.h>
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_changed = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_resumed = PTHREAD_COND_INITIALIZER; // suspended threads, see ResumeThread
+
+// A thread blocked in wait_for. Guarded by g_lock.
+typedef struct Waiter {
+    pthread_cond_t cond;
+    WHandle **handles;
+    DWORD count;
+    bool wait_all;
+    bool woken; // already woken for a signal it has not looked at yet
+    struct Waiter *next;
+} Waiter;
+
+static Waiter *g_waiters; // in arrival order, so wakeups are first come, first served
 
 typedef struct {
     bool manual_reset, signaled;
@@ -58,6 +72,25 @@ static bool is_signaled(WHandle *h, bool consume) {
     }
     case H_THREAD: return ((Thread *)h->obj)->finished;
     default: return true;
+    }
+}
+
+// Must hold g_lock. Wakes waiters on `h`: every wait-all waiter (it may need this and more), and up to
+// `wake_count` wait-any waiters, each of which can take one unit of the signal.
+#define WAKE_ALL 0x7fffffff
+static void wake_waiters(WHandle *h, int wake_count, const Waiter *except) {
+    for (Waiter *w = g_waiters; w; w = w->next) {
+        if (w == except) continue;
+        bool waits_on_h = false;
+        for (DWORD i = 0; i < w->count && !waits_on_h; i++) waits_on_h = w->handles[i] == h;
+        if (!waits_on_h) continue;
+        if (w->wait_all) {
+            pthread_cond_signal(&w->cond);
+        } else if (wake_count > 0 && !w->woken) {
+            w->woken = true;
+            pthread_cond_signal(&w->cond);
+            wake_count--;
+        }
     }
 }
 
@@ -142,7 +175,12 @@ static DWORD wait_for(DWORD count, WHandle **handles, bool wait_all, DWORD timeo
     }
 
     DWORD result = WAIT_TIMEOUT;
+    Waiter self = {.handles = handles, .count = count, .wait_all = wait_all};
+    pthread_cond_init(&self.cond, NULL);
     pthread_mutex_lock(&g_lock);
+    Waiter **tail = &g_waiters;
+    while (*tail) tail = &(*tail)->next;
+    *tail = &self;
     for (;;) {
         if (wait_all) {
             bool all = true;
@@ -161,12 +199,23 @@ static DWORD wait_for(DWORD count, WHandle **handles, bool wait_all, DWORD timeo
             }
         }
         if (timeout_ms == 0) break;
+        self.woken = false;
         if (timeout_ms == INFINITE)
-            pthread_cond_wait(&g_changed, &g_lock);
-        else if (pthread_cond_timedwait(&g_changed, &g_lock, &deadline) == ETIMEDOUT)
+            pthread_cond_wait(&self.cond, &g_lock);
+        else if (pthread_cond_timedwait(&self.cond, &g_lock, &deadline) == ETIMEDOUT)
             break;
     }
+    for (Waiter **w = &g_waiters; *w; w = &(*w)->next)
+        if (*w == &self) {
+            *w = self.next;
+            break;
+        }
+    // A wakeup meant for us that we did not use (we took another object, or timed out) goes to the next waiter.
+    for (DWORD i = 0; i < count; i++)
+        if ((result != WAIT_OBJECT_0 + i || wait_all) && is_signaled(handles[i], false))
+            wake_waiters(handles[i], 1, &self);
     pthread_mutex_unlock(&g_lock);
+    pthread_cond_destroy(&self.cond);
     return result;
 }
 
@@ -202,8 +251,9 @@ SHIM(HANDLE, CreateEventW, void *security, WBOOL manual_reset, WBOOL initial_sta
 
 static void set_event_state(WHandle *h, bool signaled) {
     pthread_mutex_lock(&g_lock);
-    ((Event *)h->obj)->signaled = signaled;
-    if (signaled) pthread_cond_broadcast(&g_changed);
+    Event *e = h->obj;
+    e->signaled = signaled;
+    if (signaled) wake_waiters(h, e->manual_reset ? WAKE_ALL : 1, NULL);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -237,7 +287,7 @@ SHIM(WBOOL, ReleaseSemaphore, WHandle *h, LONG release, LONG *previous) {
     if (previous) *previous = s->count;
     s->count += release;
     if (s->count > s->max) s->count = s->max;
-    pthread_cond_broadcast(&g_changed);
+    wake_waiters(h, release, NULL);
     pthread_mutex_unlock(&g_lock);
     return true;
 }
@@ -279,10 +329,14 @@ SHIM(void, InitializeSListHead, void *head) { memset(head, 0, 16); } // SLIST_HE
 #define MIN_THREAD_STACK (8u << 20)
 
 static void *thread_main(void *arg) {
-    Thread *t = ((WHandle *)arg)->obj;
+    WHandle *handle = arg;
+    Thread *t = handle->obj;
     teb_setup_current_thread();
+    char name[32]; // the game's entry point, so profilers can tell its threads apart
+    snprintf(name, sizeof name, "game %p", t->start);
+    pthread_setname_np(name);
     pthread_mutex_lock(&g_lock);
-    while (t->suspended) pthread_cond_wait(&g_changed, &g_lock);
+    while (t->suspended) pthread_cond_wait(&g_resumed, &g_lock);
     pthread_mutex_unlock(&g_lock);
 
     DWORD exit_code = t->start(t->arg);
@@ -290,7 +344,7 @@ static void *thread_main(void *arg) {
     pthread_mutex_lock(&g_lock);
     t->finished = true;
     t->exit_code = exit_code;
-    pthread_cond_broadcast(&g_changed);
+    wake_waiters(handle, WAKE_ALL, NULL);
     pthread_mutex_unlock(&g_lock);
     return NULL;
 }
@@ -329,7 +383,7 @@ SHIM(DWORD, ResumeThread, WHandle *h) {
     Thread *t = h->obj;
     DWORD previous_suspend_count = t->suspended;
     t->suspended = false;
-    pthread_cond_broadcast(&g_changed);
+    pthread_cond_broadcast(&g_resumed);
     pthread_mutex_unlock(&g_lock);
     return previous_suspend_count;
 }

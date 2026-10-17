@@ -60,6 +60,7 @@ typed buffer views, queries and timestamps.
 | `LOADER_MUTE=1` | Play no sound (the game's audio clock keeps running) |
 | `LOADER_WINDOWED=1` | Start windowed instead of fullscreen |
 | `LOADER_RENDER_SCALE=0.5` | Render at a fraction of the screen resolution (0.1 to 1); the layer stretches it to fit. Faster, softer |
+| `LOADER_CPU_LOG=1` | Log CPU use once a second as the kernel accounts it: per frame, kernel share, and the busiest threads |
 | `D3D12_PROFILE=1` | Log GPU time per pass and compute shader, averaged per frame |
 | `LOADER_DISPLAY=native` | Report the real screen resolution to the game instead of the window size |
 | `LOADER_TRACE=1` | Log Win32 calls (verbose) |

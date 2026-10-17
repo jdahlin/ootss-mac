@@ -283,6 +283,7 @@ static HRESULT STDMETHODCALLTYPE swapchain_Present(SwapChain *s, UINT sync_inter
     }
     s->index = (s->index + 1) % s->desc.BufferCount;
     s->presents++;
+    cpu_log_frame();
     static long max_presents = -2; // D3D12_MAX_PRESENTS=n: exit after n frames, for bounded debug runs
     if (max_presents == -2) max_presents = getenv("D3D12_MAX_PRESENTS") ? atol(getenv("D3D12_MAX_PRESENTS")) : -1;
     if (max_presents >= 0 && (long)s->presents >= max_presents) exit(0);

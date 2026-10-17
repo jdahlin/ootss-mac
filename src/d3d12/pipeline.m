@@ -218,6 +218,8 @@ HRESULT graphics_pipeline_create(Device *device, const D3D12_GRAPHICS_PIPELINE_S
     PipelineState *p = pipeline_new(device, false);
     p->topology_type = desc->PrimitiveTopologyType;
     p->sample_count = MAX(desc->SampleDesc.Count, 1);
+    p->has_outputs = desc->DSVFormat != DXGI_FORMAT_UNKNOWN;
+    for (UINT i = 0; i < desc->NumRenderTargets; i++) p->has_outputs |= desc->RTVFormats[i] != DXGI_FORMAT_UNKNOWN;
     p->cull_mode = desc->RasterizerState.CullMode == D3D12_CULL_MODE_NONE    ? MTLCullModeNone
                    : desc->RasterizerState.CullMode == D3D12_CULL_MODE_FRONT ? MTLCullModeFront
                                                                              : MTLCullModeBack;

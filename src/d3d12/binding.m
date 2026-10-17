@@ -33,14 +33,23 @@ void binding_draw_indexed(id<MTLRenderCommandEncoder> encoder, MTLPrimitiveType 
                                    instance_count, base_vertex, base_instance);
 }
 
+// The runtime's indirect draws bind the draw arguments but not the draw info (index type) the converted vertex
+// shaders also read; the direct draws set both.
+static void set_draw_info(id<MTLRenderCommandEncoder> encoder, MTLPrimitiveType primitive, uint16_t index_type) {
+    IRRuntimeDrawInfo info = {.indexType = index_type, .primitiveTopology = (uint8_t)primitive};
+    [encoder setVertexBytes:&info length:sizeof info atIndex:kIRArgumentBufferUniformsBindPoint];
+}
+
 void binding_draw_indirect(id<MTLRenderCommandEncoder> encoder, MTLPrimitiveType primitive, id<MTLBuffer> indirect,
                            uint64_t indirect_offset) {
+    set_draw_info(encoder, primitive, 0);
     IRRuntimeDrawPrimitives(encoder, primitive, indirect, indirect_offset);
 }
 
 void binding_draw_indexed_indirect(id<MTLRenderCommandEncoder> encoder, MTLPrimitiveType primitive,
                                    MTLIndexType index_type, id<MTLBuffer> index_buffer, uint64_t index_buffer_offset,
                                    id<MTLBuffer> indirect, uint64_t indirect_offset) {
+    set_draw_info(encoder, primitive, (uint16_t)(index_type + 1)); // as the direct indexed draw encodes it
     IRRuntimeDrawIndexedPrimitives(encoder, primitive, index_type, index_buffer, index_buffer_offset, indirect,
                                    indirect_offset);
 }

@@ -96,19 +96,51 @@ static NSData *largest_icon(void) {
     return ico;
 }
 
+// The game's icon is drawn on opaque black at every size. A macOS icon should have a transparent background,
+// so near-black pixels fade out with their brightness; the colored artwork stays opaque and keeps its soft edges.
+#define BACKGROUND_FADE 48 // brightness at which a pixel becomes fully opaque
+
+static NSBitmapImageRep *icon_bitmap(void) {
+    NSData *data = largest_icon();
+    NSBitmapImageRep *source = data ? [NSBitmapImageRep imageRepWithData:data] : nil;
+    if (!source) return nil;
+    NSInteger w = source.pixelsWide, h = source.pixelsHigh;
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+                                                                    pixelsWide:w
+                                                                    pixelsHigh:h
+                                                                 bitsPerSample:8
+                                                               samplesPerPixel:4
+                                                                      hasAlpha:YES
+                                                                      isPlanar:NO
+                                                                colorSpaceName:NSDeviceRGBColorSpace
+                                                                   bytesPerRow:w * 4
+                                                                  bitsPerPixel:32];
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+    [source drawInRect:NSMakeRect(0, 0, w, h)];
+    [NSGraphicsContext restoreGraphicsState];
+    uint8_t *px = rep.bitmapData; // premultiplied RGBA: color channels never exceed alpha
+    for (NSInteger i = 0; i < w * h; i++, px += 4) {
+        int brightness = MAX(px[0], MAX(px[1], px[2]));
+        if (brightness < BACKGROUND_FADE) px[3] = MIN(px[3], brightness * 255 / BACKGROUND_FADE);
+        px[3] = MAX(px[3], brightness); // keep the premultiplied invariant
+    }
+    return rep;
+}
+
 void icon_apply(void) {
     @autoreleasepool {
-        NSData *data = largest_icon();
-        NSImage *image = data ? [[NSImage alloc] initWithData:data] : nil;
-        if (image) NSApp.applicationIconImage = image;
+        NSBitmapImageRep *rep = icon_bitmap();
+        if (!rep) return;
+        NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(rep.pixelsWide, rep.pixelsHigh)];
+        [image addRepresentation:rep];
+        NSApp.applicationIconImage = image;
     }
 }
 
 bool icon_write_png(const char *path) {
     @autoreleasepool {
-        NSData *data = largest_icon();
-        NSBitmapImageRep *rep = data ? [NSBitmapImageRep imageRepWithData:data] : nil;
-        NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+        NSData *png = [icon_bitmap() representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
         return png && [png writeToFile:@(path) atomically:YES];
     }
 }

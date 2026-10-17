@@ -292,7 +292,6 @@ static void require_single_instance(void) {
 int main(int argc, char **argv) {
     log_time(); // start the clock
     g_trace = getenv("LOADER_TRACE") != NULL;
-    require_single_instance();
     if (argc > 3 && !strcmp(argv[1], "--extract-icon")) { // used by `make app`: --extract-icon out.png game.exe
         if (!realpath(argv[3], g_exe_unix_path)) {
             perror(argv[3]);
@@ -301,6 +300,7 @@ int main(int argc, char **argv) {
         load_pe(g_exe_unix_path);
         return icon_write_png(argv[2]) ? 0 : 1;
     }
+    require_single_instance();
     const char *exe = argc > 1 ? argv[1] : "sinking_star.exe";
     if (!realpath(exe, g_exe_unix_path)) {
         perror(exe);
@@ -321,6 +321,7 @@ int main(int argc, char **argv) {
     if (chdir(dirname(dir))) perror("chdir");
 
     install_crash_handler();
+    cpu_log_start();
     cocoa_init();
     d3d_backend_init();
     int(WINAPI * entry)(void) = load_pe(g_exe_unix_path);

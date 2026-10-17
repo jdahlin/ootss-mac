@@ -69,6 +69,7 @@ static PresentFn g_orig_present;
 static void *g_fps_hwnd;
 
 static WINAPI HRESULT hook_Present(void *self, uint32_t sync, uint32_t flags) {
+    cpu_log_frame();
     static uint64_t frames, t0;
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (!t0) t0 = now;
@@ -114,7 +115,7 @@ static WINAPI HRESULT hook_CreateSwapChainForHwnd(void *self, void *dev, void *h
     HRESULT r = g_orig_csc(self, dev, dmn_hwnd_for(hwnd), desc, fs, restrict_out, out);
     const uint32_t *d = desc;
     LOG("d3d: swapchain %ux%u, %u buffers -> %#x", d[0], d[1], d[7], r);
-    if (r == 0 && out && *out && getenv("LOADER_FPS")) {
+    if (r == 0 && out && *out && (getenv("LOADER_FPS") || getenv("LOADER_CPU_LOG"))) {
         g_fps_hwnd = hwnd;
         patch_present(*out);
     }

@@ -103,7 +103,10 @@ void cocoa_init(void);
 void cocoa_pump(void);
 void cocoa_window_set_fullscreen(void *hwnd, bool fullscreen);
 bool cocoa_window_is_fullscreen(void *hwnd);
-void icon_apply(void); // the game's own icon, in the Dock
+void cpu_log_start(void);  // LOADER_CPU_LOG: kernel-accounted CPU per frame and per thread
+void cpu_log_frame(void);  // called once per Present by either graphics backend
+void cpu_log_submit(void); // called once per Metal command buffer committed by our backend
+void icon_apply(void);     // the game's own icon, in the Dock
 bool icon_write_png(const char *path);
 void cocoa_window_size(void *hwnd, int *w, int *h);  // backing pixels
 void *cocoa_window_view(void *hwnd, double *scale);  // the content NSView
